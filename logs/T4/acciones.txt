@@ -4,3 +4,4 @@
 [001] {'action': 'done', 'estado': 'fallida', 'resumen': 'Falló porque tok-secret-xyz es inválido y sk-real-key-abc123 expiró'} -> {"action": "done", "estado": "fallida", "resumen": "Falló porque *** es inválido y *** expiró"}
 [001] {'action': 'done', 'estado': 'fallida', 'resumen': 'Falló porque tok-secret-xyz es inválido y sk-real-key-abc123 expiró'} -> {"action": "done", "estado": "fallida", "resumen": "Falló porque *** es inválido y *** expiró"}
 [001] {'action': 'done', 'estado': 'fallida', 'resumen': 'Falló porque tok-secret-xyz es inválido y sk-real-key-abc123 expiró'} -> {"action": "done", "estado": "fallida", "resumen": "Falló porque *** es inválido y *** expiró"}
+[001] {'action': 'done', 'estado': 'fallida', 'resumen': 'Falló porque tok-secret-xyz es inválido y sk-real-key-abc123 expiró'} -> {"action": "done", "estado": "fallida", "resumen": "Falló porque *** es inválido y *** expiró"}
