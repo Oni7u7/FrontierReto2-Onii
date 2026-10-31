@@ -11,7 +11,7 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from agent.brain import decidir
+from agent.brain import MODELO_DEFAULT, decidir
 
 load_dotenv(ROOT / ".env")
 
@@ -48,7 +48,7 @@ def crear_imagen_formulario() -> bytes:
 
 
 async def main():
-    modelo = os.getenv("MODELO") or os.getenv("OPENROUTER_MODEL") or "anthropic/claude-3.5-sonnet"
+    modelo = os.getenv("MODELO") or MODELO_DEFAULT
     api_key = os.getenv("OPENROUTER_API_KEY")
 
     if not api_key or api_key == "sk-or-v1-...":

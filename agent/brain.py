@@ -60,6 +60,7 @@ Cuando termines la tarea, la ÚLTIMA acción del array DEBE ser "done" y DEBE ir
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODELO_DEFAULT = "anthropic/claude-haiku-5.5"
 
 
 def _load_api_key() -> str:
@@ -70,7 +71,7 @@ def _load_api_key() -> str:
 
 
 def _model_name() -> str:
-    return os.getenv("MODELO") or os.getenv("OPENROUTER_MODEL") or "anthropic/claude-3.5-sonnet"
+    return os.getenv("MODELO") or MODELO_DEFAULT
 
 
 def _parse_actions(text: str) -> list[dict[str, Any]]:

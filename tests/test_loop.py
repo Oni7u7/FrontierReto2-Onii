@@ -33,7 +33,7 @@ def _fake_png():
 def _clear_env(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-fake")
     monkeypatch.setenv("EQUIPO_TOKEN", "tok-1234567890")
-    monkeypatch.setenv("OPENROUTER_MODEL", "fake-model")
+    monkeypatch.setenv("MODELO", "fake-model")
 
 
 @pytest.fixture
