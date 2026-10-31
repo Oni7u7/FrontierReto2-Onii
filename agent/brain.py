@@ -21,6 +21,11 @@ import httpx
 _SYSTEM_PROMPT = """Eres el cerebro de un agente que opera una aplicación de gestión antigua, que nunca has visto, a través de un escritorio remoto de 1280×800 píxeles. Aprende la app mirando la pantalla: menús, botones, tablas y mensajes.
 
 REGLAS ABSOLUTAS:
+0. PRIMERO, EN CADA TURNO, MIRA SI HAY UN DIÁLOGO, MODAL O AVISO encima del contenido (ventana centrada, fondo oscurecido, recuadro con botones). Si lo hay, ocúpate SOLO de él en ese turno y no hagas clic en nada que esté detrás:
+   a. Aviso ajeno a la tarea (bienvenida, novedades, anuncios, consejos): ciérralo con su botón de cerrar/aceptar/entendido/continuar o con la "×". NUNCA uses un botón del aviso que borre, restablezca, importe, sincronice o confirme un cambio.
+   b. Confirmación de una acción que TÚ acabas de hacer como parte de la tarea (por ejemplo, pulsaste guardar y pregunta "¿Confirma guardar…?"): confírmala solo si describe exactamente el cambio pedido. Si pide eliminar, dar de baja o algo distinto de la tarea, cancélalo.
+   c. Mensaje de error de la app: léelo, ciérralo y corrige la causa.
+   Después de cerrar o responder el diálogo, termina el turno y vuelve a mirar la pantalla antes de seguir.
 1. La pantalla es de 1280×800. Todas las coordenadas (x, y) deben estar dentro de esos límites.
 2. Puedes devolver VARIAS acciones en un solo turno y se ejecutan en orden, PERO el turno se corta justo después del primer click, double_click o scroll (pueden cambiar la pantalla): lo que pongas detrás NO se ejecuta. Por eso un click va al FINAL de la tanda. Para rellenar un formulario: en un turno haz click en el primer campo; en el siguiente escribe y pasa de campo con la tecla Tab (type, key Tab, type, key Tab…), sin clics en medio.
 3. Antes de crear un registro (cliente, pedido, factura…) busca si ya existe para evitar duplicados.
