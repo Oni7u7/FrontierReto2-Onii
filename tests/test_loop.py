@@ -315,9 +315,8 @@ async def test_done_mezclado_no_termina(mock_desktop):
     assert "Confirmado" in result["resumen"]
     # El click del primer turno SÍ se ejecutó
     assert mock_desktop.click.await_count >= 1
-    # Se consultó al modelo al menos DOS veces (primer turno + segundo turno,
-    # posiblemente una tercera por verificación final)
-    assert call_idx >= 2
+    # Exactamente DOS consultas: primer turno + segundo turno (sin verificación final)
+    assert call_idx == 2
 
 
 # ------------------------------------------------------------------
@@ -439,5 +438,25 @@ async def test_tanda_cortada_tras_click_y_una_captura_por_turno(mock_desktop):
     tipeos = [c.args[0] for c in mock_desktop.type_text.await_args_list]
     assert tipeos == ["uno", "dos"]
     assert "2 acciones posteriores NO se ejecutaron" in historiales[1]
-    # 3 turnos del bucle → 3 capturas (más, como mucho, la de la verificación final)
-    assert mock_desktop.screenshot.await_count <= 4
+    # 3 turnos del bucle → exactamente 3 capturas
+    assert mock_desktop.screenshot.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_tras_done_no_reconecta_ni_consulta(mock_desktop):
+    """Al reportar terminada se deja de operar: una conexión y una consulta."""
+    llamadas = 0
+
+    async def _fake_decidir(*args, **kwargs):
+        nonlocal llamadas
+        llamadas += 1
+        return [{"action": "done", "estado": "terminada", "resumen": "ok"}]
+
+    with patch("agent.loop.Desktop", return_value=mock_desktop) as cls:
+        with patch("agent.loop.decidir", new=_fake_decidir):
+            await loop.ejecutar_tarea(
+                task_id="T-sin-verif", tarea="x", ws_url="ws://mock:0", password="p")
+
+    assert llamadas == 1
+    assert cls.call_count == 1
+    assert mock_desktop.connect.await_count == 1

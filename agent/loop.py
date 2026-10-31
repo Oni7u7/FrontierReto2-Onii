@@ -13,8 +13,7 @@ ejecutar_tarea(tarea, ws_url, password):
   4. Límite duro 4 m 15 s (255 s).
   5. Detección de bucles (misma acción + screenshot igual ×3).
   6. Filtro de secretos en resumen y logs (incluye password del escritorio).
-  7. Verificación final opcional (conservadora: no invierte terminada).
-  8. Al terminar, cancelar o fallar cierra Desktop inmediatamente.
+  7. Al terminar, cancelar o fallar cierra Desktop inmediatamente.
 """
 
 import asyncio
@@ -271,38 +270,6 @@ async def ejecutar_tarea(
     # ---------- formato de respuesta + filtrar secretos (incluye password) ----------
     resumen = _normalizar_respuesta(resumen, estado)
     resumen = _filtrar_secretos(resumen, extra=[password])
-
-    # ---------- verificación final (conservadora) ----------
-    if estado == "terminada":
-        if _queda() > 10.0 and os.getenv("OPENROUTER_API_KEY"):
-            try:
-                desktop2 = Desktop(ws_url, password)
-                await asyncio.wait_for(desktop2.connect(), timeout=10.0)
-                final_img = await asyncio.wait_for(
-                    desktop2.screenshot(settle=SETTLE), timeout=10.0
-                )
-                verif = await asyncio.wait_for(
-                    decidir(
-                        f"Verificación: ¿la tarea '{tarea}' quedó realmente resuelta? "
-                        "Responde SOLO un JSON: {{\"ok\": true}} o {{\"ok\": false, \"motivo\": \"...\"}}.",
-                        final_img,
-                        historial,
-                    ),
-                    timeout=min(STEP_TIMEOUT, max(5.0, _queda())),
-                )
-                await desktop2.close()
-                if verif and verif[-1].get("action") == "done":
-                    verif_resumen = verif[-1].get("resumen", "")
-                    if "ok: false" in verif_resumen.lower() or '"ok": false' in verif_resumen.lower():
-                        estado = "fallida"
-                        resumen = f"Verificación final indicó que la tarea no quedó completa: {verif_resumen}"
-            except Exception:
-                pass
-            finally:
-                try:
-                    await desktop2.close()
-                except Exception:
-                    pass
 
     return {"estado": estado, "resumen": resumen}
 
