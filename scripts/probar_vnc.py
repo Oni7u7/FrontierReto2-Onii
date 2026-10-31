@@ -20,13 +20,16 @@ import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from PIL import Image, ImageChops
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-load_dotenv(ROOT / ".env")
+# override=True: el .env manda. Sin él, una ESCRITORIO_WS vieja exportada en el
+# shell (p. ej. ws://127.0.0.1:8765 del servidor simulado) gana en silencio.
+load_dotenv(ROOT / ".env", override=True)
 
 from agent.vnc import Desktop  # noqa: E402
 from scripts.runner import base_https  # noqa: E402
@@ -58,9 +61,27 @@ def _pixeles_distintos(a: Image.Image, b: Image.Image) -> int:
     return diff.histogram()[255]
 
 
-async def _reset():
+def _escritorio_ws() -> str:
+    """ESCRITORIO_WS obligatoria, remota y con esquema ws/wss; si no, sale con
+    un mensaje claro. Nunca imprime la URL."""
+    ws_url = (os.getenv("ESCRITORIO_WS") or "").strip()
+    if not ws_url:
+        print("❌ Falta ESCRITORIO_WS en .env (wss://.../websockify)")
+        sys.exit(1)
+    partes = urlsplit(ws_url)
+    if partes.scheme not in ("ws", "wss") or not partes.hostname:
+        print("❌ ESCRITORIO_WS no es una URL ws:// o wss:// válida")
+        sys.exit(1)
+    if partes.hostname in ("127.0.0.1", "localhost", "::1"):
+        print("❌ ESCRITORIO_WS apunta a esta máquina (¿servidor simulado?); "
+              "pon la URL wss:// del escritorio real en .env")
+        sys.exit(1)
+    return ws_url
+
+
+async def _reset(ws_url: str):
     import httpx
-    url = base_https(os.environ["ESCRITORIO_WS"])
+    url = base_https(ws_url)
     token = os.getenv("ESCRITORIO_TOKEN", "")
     async with httpx.AsyncClient(timeout=60) as c:
         r = await c.post(f"{url}/__reset", headers={"Authorization": f"Bearer {token}"})
@@ -75,10 +96,10 @@ async def main():
                     help="llama /__reset al final para dejar el escritorio limpio")
     args = ap.parse_args()
 
-    ws_url = os.getenv("ESCRITORIO_WS")
+    ws_url = _escritorio_ws()
     password = os.getenv("ESCRITORIO_PASSWORD")
-    if not ws_url or password is None:
-        print("❌ Faltan ESCRITORIO_WS o ESCRITORIO_PASSWORD en .env")
+    if password is None:
+        print("❌ Falta ESCRITORIO_PASSWORD en .env")
         sys.exit(1)
 
     ok = True
@@ -140,7 +161,7 @@ async def main():
         await d.close()
 
     if args.reset:
-        await _reset()
+        await _reset(ws_url)
 
     print("\n" + ("✅ Prueba básica OK" if ok else "❌ Hay problemas: revisa las capturas"))
     sys.exit(0 if ok else 1)
