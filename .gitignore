@@ -20,3 +20,6 @@ driver/
 # IDEs
 .vscode/
 .idea/
+
+# Logs de tareas (capturas, acciones, resúmenes)
+logs/
