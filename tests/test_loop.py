@@ -368,3 +368,35 @@ async def test_accion_invalida_se_reporta_al_modelo_sin_matar_la_tarea(mock_desk
     assert "acción inválida" in historiales[1] and "Intro" in historiales[1]
     # el turno se corta: el click posterior a la acción inválida no se ejecuta
     assert mock_desktop.click.await_count == 0
+
+
+# ------------------------------------------------------------------
+# Test: formato de la línea respuesta
+# ------------------------------------------------------------------
+
+def test_respuesta_pegada_se_mueve_a_linea_propia():
+    r = loop._normalizar_respuesta(
+        'La lista muestra "10 proveedor(es)". En Medellín: PR-0001, PR-0003 y PR-0008. respuesta: 3',
+        "terminada",
+    )
+    lineas = r.splitlines()
+    assert lineas[-1] == "respuesta: 3"
+    assert sum(1 for l in lineas if "respuesta:" in l.lower()) == 1
+
+
+def test_respuesta_dos_datos_y_ya_bien_formada_no_cambian():
+    ok = "Revisé el pedido.\nrespuesta: 45; Juan Pérez"
+    assert loop._normalizar_respuesta(ok, "terminada") == ok
+    assert loop._normalizar_respuesta("Respuesta: 7", "terminada") == "respuesta: 7"
+
+
+def test_fallida_nunca_lleva_linea_respuesta():
+    r = loop._normalizar_respuesta(
+        "No hay sección de pedidos.\nrespuesta: no disponible\nNo se modificó nada.", "fallida")
+    assert "respuesta" not in r.lower()
+    assert "No hay sección de pedidos." in r and "No se modificó nada." in r
+
+
+def test_sin_respuesta_no_toca_el_resumen():
+    s = "Se actualizó el teléfono a 3109998877."
+    assert loop._normalizar_respuesta(s, "terminada") == s

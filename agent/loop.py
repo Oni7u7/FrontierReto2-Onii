@@ -19,6 +19,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,30 @@ def _filtrar_secretos(texto: str, extra: list[str] | None = None) -> str:
                 texto = texto.replace(val, "***")
     texto = _borrar_api_keys(texto)
     return texto
+
+
+_RE_RESPUESTA = re.compile(r"respuesta\s*:", re.IGNORECASE)
+
+
+def _normalizar_respuesta(resumen: str, estado: str) -> str:
+    """Deja la respuesta como lo exige el evaluador.
+
+    - terminada: si "respuesta:" va pegada a otro texto, se mueve a una línea
+      propia al final ("respuesta: <valor>"), para que el primer número de esa
+      línea sea el valor y no otro dato del resumen.
+    - fallida: se quita cualquier línea "respuesta:" (una pregunta imposible
+      no la lleva y una tarea que no es pregunta nunca la necesita).
+    """
+    m = _RE_RESPUESTA.search(resumen)
+    if not m:
+        return resumen
+    fin_linea = resumen.find("\n", m.end())
+    fin_linea = len(resumen) if fin_linea == -1 else fin_linea
+    valor = resumen[m.end():fin_linea].strip()
+    resto = (resumen[:m.start()].rstrip() + resumen[fin_linea:]).strip()
+    if estado != "terminada" or not valor:
+        return resto
+    return f"{resto}\nrespuesta: {valor}" if resto else f"respuesta: {valor}"
 
 
 def _borrar_api_keys(texto: str) -> str:
@@ -218,7 +243,8 @@ async def ejecutar_tarea(
     finally:
         await _cerrar()
 
-    # ---------- filtrar secretos (incluye password del escritorio) ----------
+    # ---------- formato de respuesta + filtrar secretos (incluye password) ----------
+    resumen = _normalizar_respuesta(resumen, estado)
     resumen = _filtrar_secretos(resumen, extra=[password])
 
     # ---------- verificación final (conservadora) ----------
