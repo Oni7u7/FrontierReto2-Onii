@@ -30,7 +30,10 @@ import httpx
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(ROOT / ".env")
+# override=True: el .env manda. Sin él, variables viejas exportadas en el shell
+# (p. ej. las del servidor simulado en 127.0.0.1) ganan en silencio y el agente
+# recibiría ese escritorio en vez del real.
+load_dotenv(ROOT / ".env", override=True)
 
 PRUEBAS = Path(__file__).resolve().parent.parent / "pruebas"
 
@@ -65,6 +68,11 @@ def _check_env():
             missing.append(name)
     if missing:
         print(f"❌ Faltan variables de entorno: {', '.join(missing)}")
+        sys.exit(1)
+    from urllib.parse import urlsplit
+    if urlsplit(ESCRITORIO_WS).hostname in ("127.0.0.1", "localhost", "::1"):
+        print("❌ ESCRITORIO_WS apunta a esta máquina (¿servidor simulado?); "
+              "pon la URL wss:// del escritorio real en .env")
         sys.exit(1)
 
 
