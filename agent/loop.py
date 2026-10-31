@@ -10,20 +10,26 @@ ejecutar_tarea(tarea, ws_url, password):
      el done, toma captura nueva y vuelve a consultar.
      Solo se acepta done cuando va SOLO en el turno.
      Excepción: done con estado fallida y sin acciones previas se acepta.
-  4. Límite duro 4 m 15 s (255 s).
-  5. Detección de bucles (misma acción + screenshot igual ×3).
+  4. Límite duro 4 m 40 s (280 s) de los 5 min del evaluador.
+  5. Detección de ciclos: si un turno repite la misma pantalla con las mismas
+     acciones que un turno anterior (A,A o A,B,A,B…), se avisa al modelo para
+     que cambie de estrategia; si sigue repitiendo, la tarea falla.
   6. Filtro de secretos en resumen y logs (incluye password del escritorio).
   7. Al terminar, cancelar o fallar cierra Desktop inmediatamente.
+  8. logs/<id>/ guarda tarea.txt y resultado.json para revisar corridas.
 """
 
 import asyncio
 import hashlib
+import io
 import json
 import os
 import re
 import time
 from pathlib import Path
 from typing import Any
+
+from PIL import Image
 
 from agent.brain import decidir
 from agent.vnc import Desktop
@@ -33,13 +39,16 @@ from agent.vnc import Desktop
 # Configuración
 # ------------------------------------------------------------------
 
-MAX_TAREA_SEG = 255          # 4 min 15 s
-MAX_PASOS = 50               # límite de iteraciones por tarea
+MAX_TAREA_SEG = 280          # 4 min 40 s: margen sobre los 5 min del evaluador
+MAX_PASOS = 80               # límite de turnos por tarea (el tiempo manda antes)
 SETTLE = 1.3                 # segundos de espera tras cada acción
 STEP_TIMEOUT = 90.0          # máximo para una llamada al modelo
 # Acciones que pueden cambiar de pantalla: la tanda se corta después de ellas
 # y lo que venía detrás se descarta (apuntaría a una pantalla que ya no existe).
 CORTA_TANDA = {"click", "double_click", "scroll"}
+# Ciclos: cada repetición de (pantalla, acciones) ya vista se avisa al modelo;
+# al llegar a MAX_REPETICIONES la tarea falla en vez de agotar el tiempo.
+MAX_REPETICIONES = 6
 
 _SECRETOS_ENV = ["OPENROUTER_API_KEY", "EQUIPO_TOKEN"]
 
@@ -93,6 +102,26 @@ def _recortar_tanda(acciones: list[dict]) -> tuple[list[dict], list[dict]]:
     return acciones, []
 
 
+def _huella_pantalla(captura: bytes) -> str:
+    """Hash de la captura reducida a 160x100 en grises de 16 niveles: ignora
+    diferencias mínimas (antialias, un parpadeo) pero distingue pantallas."""
+    try:
+        img = Image.open(io.BytesIO(captura)).convert("L").resize((160, 100))
+        datos = bytes(v >> 4 for v in img.tobytes())
+    except Exception:
+        datos = captura
+    return hashlib.sha256(datos).hexdigest()[:16]
+
+
+def _firma_turno(captura: bytes, acciones: list[dict]) -> str | None:
+    """Firma (pantalla, acciones) de un turno. None si el turno no hace nada
+    que pueda ciclar (solo wait/nota/done)."""
+    reales = [a for a in acciones if a.get("action") not in ("wait", "nota", "done")]
+    if not reales:
+        return None
+    return _huella_pantalla(captura) + json.dumps(reales, sort_keys=True, ensure_ascii=False)
+
+
 def _borrar_api_keys(texto: str) -> str:
     """Regex simple para claves tipo sk-or-..., bearer tokens largos."""
     import re
@@ -123,9 +152,9 @@ async def ejecutar_tarea(
     paso = 0
     total_acciones_ejecutadas = 0
 
-    # Para detección de bucles
-    ultima_accion_json: str | None = None
-    repeticiones_bucle = 0
+    # Detección de ciclos: firma (pantalla, acciones) -> turno en que se vio
+    firmas_vistas: dict[str, int] = {}
+    repeticiones = 0
 
     estado = "en_curso"
     resumen = ""
@@ -164,6 +193,8 @@ async def ejecutar_tarea(
             decidir(tarea, captura, historial),
             timeout=min(STEP_TIMEOUT, max(5.0, _queda())),
         )
+
+    (log_dir / "tarea.txt").write_text(_filtrar_secretos(tarea, extra=[password]), encoding="utf-8")
 
     try:
         # ---------- conectar ----------
@@ -205,6 +236,28 @@ async def ejecutar_tarea(
                         )
                     })
 
+            # 3b. ciclos: ¿ya estuvimos en esta pantalla haciendo exactamente esto?
+            firma = _firma_turno(captura, acciones_a_ejecutar)
+            if firma is not None and firma in firmas_vistas:
+                repeticiones += 1
+                if repeticiones >= MAX_REPETICIONES:
+                    estado = "fallida"
+                    resumen = (
+                        "La tarea entró en un ciclo: repitió la misma pantalla y las mismas "
+                        f"acciones {repeticiones} veces sin avanzar. No se completó."
+                    )
+                    break
+                historial.append({
+                    "nota": (
+                        f"CICLO DETECTADO ({repeticiones}/{MAX_REPETICIONES - 1} avisos): en el turno "
+                        f"{firmas_vistas[firma]} ya estuviste en esta misma pantalla e hiciste exactamente "
+                        "estas acciones; vas y vuelves sin avanzar. Cambia de estrategia: usa el filtro o "
+                        "buscador, apunta con 'nota' lo que ya leíste, o termina con done."
+                    )
+                })
+            elif firma is not None:
+                firmas_vistas[firma] = paso
+
             # 4. ejecutar secuencialmente
             for idx, accion in enumerate(acciones_a_ejecutar):
                 if estado != "en_curso":
@@ -212,23 +265,7 @@ async def ejecutar_tarea(
 
                 accion_str = json.dumps(accion, ensure_ascii=False)
 
-                # detección de bucle: solo la ÚLTIMA acción del turno
                 es_ultima = (idx == len(acciones_a_ejecutar) - 1)
-                if es_ultima and accion.get("action") != "done":
-                    h = hashlib.sha256(captura).hexdigest()[:16]
-                    act_hash = f"{accion_str}_{h}"
-                    if act_hash == ultima_accion_json:
-                        repeticiones_bucle += 1
-                        if repeticiones_bucle >= 2:
-                            estado = "fallida"
-                            resumen = (
-                                "La tarea entró en bucle: la pantalla y las acciones "
-                                f"no cambiaron tras {repeticiones_bucle + 1} intentos."
-                            )
-                            break
-                    else:
-                        repeticiones_bucle = 0
-                        ultima_accion_json = act_hash
 
                 # ejecutar; una acción mal formada (tecla desconocida, campo
                 # faltante) se reporta al modelo y se corta el turno
@@ -253,14 +290,14 @@ async def ejecutar_tarea(
         # ---------- post-bucle ----------
         if estado == "en_curso":
             estado = "fallida"
-            resumen = f"Tiempo o pasos agotados ({paso} pasos, {255 - int(_queda())} s)."
+            resumen = f"Tiempo o pasos agotados ({paso} pasos, {MAX_TAREA_SEG - int(_queda())} s)."
 
     except asyncio.CancelledError:
         estado = "fallida"
         resumen = "cancelada por tarea nueva"
     except asyncio.TimeoutError:
         estado = "fallida"
-        resumen = "Tiempo de ejecución agotado (4 min 15 s)."
+        resumen = f"Tiempo de ejecución agotado ({MAX_TAREA_SEG} s)."
     except Exception as exc:
         estado = "fallida"
         resumen = f"Error durante la ejecución: {type(exc).__name__}: {exc}"
@@ -270,6 +307,14 @@ async def ejecutar_tarea(
     # ---------- formato de respuesta + filtrar secretos (incluye password) ----------
     resumen = _normalizar_respuesta(resumen, estado)
     resumen = _filtrar_secretos(resumen, extra=[password])
+    try:
+        (log_dir / "resultado.json").write_text(
+            json.dumps({"estado": estado, "resumen": resumen, "pasos": paso,
+                        "segundos": round(time.monotonic() - start, 1)}, ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
 
     return {"estado": estado, "resumen": resumen}
 
@@ -302,7 +347,7 @@ async def _ejecutar_accion(
         )
     elif tipo == "wait":
         await asyncio.sleep(SETTLE)
-    elif tipo == "done":
+    elif tipo in ("done", "nota"):
         pass
     else:
         raise ValueError(f"Acción desconocida: {tipo}")

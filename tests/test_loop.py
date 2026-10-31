@@ -192,8 +192,8 @@ async def test_secretos_filtrados(mock_desktop, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_deteccion_bucle(mock_desktop):
-    """Si el modelo repite la misma acción 3 veces con la misma pantalla,
-    la tarea termina como fallida."""
+    """Si el modelo repite siempre la misma acción con la misma pantalla,
+    se le avisa y, si insiste, la tarea termina como fallida por ciclo."""
 
     # Siempre devuelve el mismo click
     async def _fake_bucle(*args, **kwargs):
@@ -212,7 +212,7 @@ async def test_deteccion_bucle(mock_desktop):
             )
 
     assert result["estado"] == "fallida"
-    assert "bucle" in result["resumen"].lower()
+    assert "ciclo" in result["resumen"].lower()
 
 
 # ------------------------------------------------------------------
@@ -460,3 +460,112 @@ async def test_tras_done_no_reconecta_ni_consulta(mock_desktop):
     assert llamadas == 1
     assert cls.call_count == 1
     assert mock_desktop.connect.await_count == 1
+
+
+def _png_color(color):
+    import io as _io
+    from PIL import Image
+    buf = _io.BytesIO()
+    Image.new("RGB", (1280, 800), color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_ciclo_periodo_2_avisa_y_luego_falla(mock_desktop):
+    """Ir y volver entre dos pantallas (Siguiente/Anterior) es un ciclo aunque
+    ninguna repetición sea consecutiva: se avisa al modelo y luego se corta."""
+    pantallas = [_png_color("white"), _png_color("gray")]
+    n = {"cap": 0}
+
+    async def _cap(*a, **k):
+        n["cap"] += 1
+        return pantallas[(n["cap"] - 1) % 2]
+
+    mock_desktop.screenshot = AsyncMock(side_effect=_cap)
+    historiales = []
+
+    async def _fake_decidir(tarea, captura, historial, *a, **k):
+        historiales.append(json.dumps(historial, ensure_ascii=False))
+        x = 200 if len(historiales) % 2 else 50   # Siguiente, Anterior, Siguiente…
+        return [{"action": "click", "x": x, "y": 740}]
+
+    with patch("agent.loop.Desktop", return_value=mock_desktop):
+        with patch("agent.loop.decidir", new=_fake_decidir):
+            with patch.object(loop, "SETTLE", 0.0):
+                result = await loop.ejecutar_tarea(
+                    task_id="T-ciclo", tarea="x", ws_url="ws://mock:0", password="p")
+
+    assert result["estado"] == "fallida"
+    assert "ciclo" in result["resumen"].lower()
+    # turnos 1 y 2 son nuevos; desde el 3 cada uno repite → 6 repeticiones = 8 turnos
+    assert len(historiales) == 2 + loop.MAX_REPETICIONES
+    assert "CICLO DETECTADO" in historiales[3]
+    assert "CICLO DETECTADO" not in historiales[2]
+
+
+@pytest.mark.asyncio
+async def test_avanzar_no_es_ciclo(mock_desktop):
+    """La misma acción sobre pantallas distintas (paginar hacia adelante) no
+    es un ciclo."""
+    n = {"cap": 0}
+
+    async def _cap(*a, **k):
+        n["cap"] += 1
+        return _png_color((n["cap"] * 20 % 256, 0, 0))
+
+    mock_desktop.screenshot = AsyncMock(side_effect=_cap)
+    turnos = iter([[{"action": "click", "x": 200, "y": 740}]] * 7
+                  + [[{"action": "done", "estado": "terminada", "resumen": "ok"}]])
+
+    async def _fake_decidir(*a, **k):
+        return next(turnos)
+
+    with patch("agent.loop.Desktop", return_value=mock_desktop):
+        with patch("agent.loop.decidir", new=_fake_decidir):
+            with patch.object(loop, "SETTLE", 0.0):
+                result = await loop.ejecutar_tarea(
+                    task_id="T-avanza", tarea="x", ws_url="ws://mock:0", password="p")
+
+    assert result["estado"] == "terminada"
+    assert mock_desktop.click.await_count == 7
+
+
+@pytest.mark.asyncio
+async def test_nota_queda_en_historial_y_no_corta(mock_desktop):
+    """'nota' no toca la pantalla, no corta la tanda y el modelo la ve después."""
+    historiales = []
+    turnos = iter([
+        [{"action": "nota", "texto": "página 1: 2 en Medellín"}, {"action": "type", "text": "a"},
+         {"action": "click", "x": 1, "y": 1}],
+        [{"action": "done", "estado": "terminada", "resumen": "ok"}],
+    ])
+
+    async def _fake_decidir(tarea, captura, historial, *a, **k):
+        historiales.append(json.dumps(historial, ensure_ascii=False))
+        return next(turnos)
+
+    with patch("agent.loop.Desktop", return_value=mock_desktop):
+        with patch("agent.loop.decidir", new=_fake_decidir):
+            with patch.object(loop, "SETTLE", 0.0):
+                await loop.ejecutar_tarea(
+                    task_id="T-nota", tarea="x", ws_url="ws://mock:0", password="p")
+
+    assert "página 1: 2 en Medellín" in historiales[1]
+    assert mock_desktop.type_text.await_count == 1
+    assert mock_desktop.click.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_guarda_tarea_y_resultado_sin_secretos(mock_desktop):
+    async def _fake_decidir(*a, **k):
+        return [{"action": "done", "estado": "terminada", "resumen": "listo clave-xyz"}]
+
+    with patch("agent.loop.Desktop", return_value=mock_desktop):
+        with patch("agent.loop.decidir", new=_fake_decidir):
+            await loop.ejecutar_tarea(
+                task_id="T-res", tarea="usa clave-xyz", ws_url="ws://mock:0", password="clave-xyz")
+
+    d = Path("logs") / "T-res"
+    assert (d / "tarea.txt").read_text(encoding="utf-8") == "usa ***"
+    res = json.loads((d / "resultado.json").read_text(encoding="utf-8"))
+    assert res["estado"] == "terminada" and "clave-xyz" not in res["resumen"]
