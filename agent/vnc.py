@@ -1,255 +1,297 @@
-"""Cliente VNC (RFB 3.8) propio sobre WebSocket (websockify).
-
-Sin navegador ni herramientas externas: solo websockets + DES (pycryptodome)
-para la autenticacion VNC + Pillow para guardar la captura como PNG.
 """
+vnc.py — Cliente RFB 3.8 propio sobre WebSocket (sin Playwright).
+
+Conecta directamente al endpoint /websockify del escritorio,
+autentica con DES-VNC, pide framebuffer y expone operaciones
+de bajo nivel: screenshot, click, double_click, type_text,
+press, scroll.
+
+Las pausas post-acción NO van aquí; el bucle llama
+screenshot(settle=...) cuando necesita estabilizar.
+"""
+
 import asyncio
 import io
 import struct
+from typing import Optional
 
 import websockets
-from Crypto.Cipher import DES
 from PIL import Image
-
-# --- tiempos que exige el escritorio ---
-CLICK_HOLD = 0.13      # >100 ms entre bajar y soltar, o el clic se ignora
-SETTLE = 1.3           # la pantalla tarda hasta 1 s en repintar
-
-KEYSYMS = {
-    "enter": 0xFF0D, "return": 0xFF0D, "tab": 0xFF09, "backspace": 0xFF08,
-    "escape": 0xFF1B, "esc": 0xFF1B, "delete": 0xFFFF, "home": 0xFF50,
-    "left": 0xFF51, "up": 0xFF52, "right": 0xFF53, "down": 0xFF54,
-    "pageup": 0xFF55, "pagedown": 0xFF56, "end": 0xFF57, "space": 0x20,
-    "shift": 0xFFE1, "ctrl": 0xFFE3, "control": 0xFFE3, "alt": 0xFFE9,
-}
-for _i in range(1, 13):
-    KEYSYMS[f"f{_i}"] = 0xFFBD + _i
-
-
-def char_keysym(ch: str) -> int:
-    cp = ord(ch)
-    if ch == "\n":
-        return 0xFF0D
-    if ch == "\t":
-        return 0xFF09
-    if cp < 0x100:          # ASCII y Latin-1 (incluye ñ, tildes)
-        return cp
-    return 0x01000000 + cp  # Unicode general
+from Crypto.Cipher import DES
 
 
 def _vnc_des_key(password: str) -> bytes:
-    key = password.encode("latin-1", "ignore")[:8].ljust(8, b"\0")
-    # VNC invierte el orden de los bits de cada byte de la clave
-    return bytes(int(f"{b:08b}"[::-1], 2) for b in key)
+    """Deriva la clave DES de 8 bytes que exige el auth VNC.
 
-
-class RFBError(Exception):
-    pass
+    La contraseña se trunca/rellena a 8 bytes y luego se
+    invierten los bits de cada byte (bit 0 ↔ bit 7, etc.).
+    """
+    pw = password.encode("latin-1")[:8]
+    pw = pw + b"\x00" * (8 - len(pw))
+    return bytes(
+        sum(((byte >> i) & 1) << (7 - i) for i in range(8))
+        for byte in pw
+    )
 
 
 class Desktop:
+    """Controlador de escritorio remoto vía RFB sobre WebSocket."""
+
     def __init__(self, url: str, password: str):
         self.url = url
-        self._password = password
-        self.ws = None
+        self.password = password
+        self.ws: Optional[websockets.WebSocketClientProtocol] = None
+        self.width: int = 0
+        self.height: int = 0
+        self._connected: bool = False
         self._buf = bytearray()
-        self.width = 0
-        self.height = 0
-        self._fb = None          # bytearray BGRX
-        self._mask = 0
-        self._x = 0
-        self._y = 0
 
-    # ---------- bajo nivel ----------
-    async def _read(self, n: int) -> bytes:
+    # ------------------------------------------------------------------
+    # Ciclo de vida
+    # ------------------------------------------------------------------
+
+    async def connect(self) -> None:
+        """Handshake RFB 3.8 + VNC auth + inicialización."""
+        self.ws = await websockets.connect(self.url, subprotocols=["binary"])
+
+        # 1. Versión
+        await self._send(b"RFB 003.008\n")
+        assert await self._recv_exact(12) == b"RFB 003.008\n", "version mismatch"
+
+        # 2. Security types
+        num_types = (await self._recv_exact(1))[0]
+        if num_types == 0:
+            raise Exception("No security types offered")
+        types = await self._recv_exact(num_types)
+        if 2 not in types:
+            raise Exception("VNC auth (type 2) not offered")
+        await self._send(b"\x02")  # Elegimos VNC auth
+
+        # 3. VNC authentication
+        challenge = await self._recv_exact(16)
+        key = _vnc_des_key(self.password)
+        cipher = DES.new(key, DES.MODE_ECB)
+        response = cipher.encrypt(challenge)
+        await self._send(response)
+
+        # 4. Auth result (big-endian según RFB)
+        result = struct.unpack("!I", await self._recv_exact(4))[0]
+        if result != 0:
+            reason_len = struct.unpack("!I", await self._recv_exact(4))[0]
+            reason = (await self._recv_exact(reason_len)).decode("latin-1", errors="replace")
+            raise Exception(f"Autenticacion fallida: {reason}")
+
+        # 5. ClientInit (shared = 1)
+        await self._send(b"\x01")
+
+        # 6. ServerInit (big-endian)
+        self.width = struct.unpack("!H", await self._recv_exact(2))[0]
+        self.height = struct.unpack("!H", await self._recv_exact(2))[0]
+        _pix_format = await self._recv_exact(16)
+        name_len = struct.unpack("!I", await self._recv_exact(4))[0]
+        await self._recv_exact(name_len)
+
+        # 7. SetPixelFormat → pedimos 32-bit BGRX
+        #    RFB: type(1) + pad(3) + format(16) = 20 bytes
+        pf = struct.pack(
+            "!BBBBHHHBBBxxx",
+            32,   # bits-per-pixel
+            24,   # depth
+            0,    # big-endian flag
+            1,    # true-color
+            255, 255, 255,   # red, green, blue max
+            16, 8, 0,        # red, green, blue shift
+        )
+        await self._send(b"\x00\x00\x00\x00" + pf)
+
+        # 8. SetEncodings → solo Raw (0)
+        #    RFB: type(1) + pad(1) + count(2) + encodings(4*N)
+        await self._send(struct.pack("!BBHi", 2, 0, 1, 0))
+
+        self._connected = True
+
+    async def close(self) -> None:
+        """Cierra el WebSocket."""
+        if self.ws:
+            await self.ws.close()
+            self.ws = None
+        self._connected = False
+
+    # ------------------------------------------------------------------
+    # Operaciones públicas (sin pausas internas)
+    # ------------------------------------------------------------------
+
+    async def screenshot(self, settle: float = 0.0) -> bytes:
+        """Pide un FramebufferUpdate completo y lo devuelve como PNG.
+
+        Si settle > 0, espera ese tiempo antes de pedir la imagen.
+        """
+        if settle > 0:
+            await asyncio.sleep(settle)
+
+        if not self._connected:
+            raise RuntimeError("No conectado")
+
+        # FramebufferUpdateRequest: incremental=0, full screen
+        req = struct.pack("!BBHHHH", 3, 0, 0, 0, self.width, self.height)
+        await self._send(req)
+
+        # Leer hasta recibir FramebufferUpdate (type 0), saltando Bell, etc.
+        while True:
+            msg_type, payload = await self._read_message()
+            if msg_type == 0:
+                rects = payload
+                break
+
+        # Construir imagen RGB
+        img = Image.new("RGB", (self.width, self.height))
+        for x, y, w, h, _enc, pixels in rects:
+            # Convertir BGRX crudo → RGB
+            row_rgb = bytearray()
+            for row in range(h):
+                row_start = row * w * 4
+                for col in range(w):
+                    p = row_start + col * 4
+                    b, g, r = pixels[p], pixels[p + 1], pixels[p + 2]
+                    row_rgb.extend((r, g, b))
+                # dibujar fila entera de una vez
+                row_img = Image.frombytes("RGB", (w, 1), bytes(row_rgb[-w * 3:]))
+                img.paste(row_img, (x, y + row))
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    async def click(self, x: int, y: int) -> None:
+        """Clic izquierdo: move + down + up."""
+        await self._pointer(0, x, y)   # move (sin botón)
+        await self._pointer(1, x, y)   # botón izquierdo presionado
+        await self._pointer(0, x, y)   # botón soltado
+
+    async def double_click(self, x: int, y: int) -> None:
+        """Doble clic: dos clics seguidos."""
+        await self.click(x, y)
+        await self.click(x, y)
+
+    async def type_text(self, text: str, select_all: bool = True) -> None:
+        """Escribe texto; si select_all=True envía Ctrl+A primero."""
+        if select_all:
+            await self._key(0xFFE3, True)   # Ctrl  down
+            await self._key(0x61, True)     # a     down
+            await self._key(0x61, False)    # a     up
+            await self._key(0xFFE3, False)  # Ctrl  up
+
+        for ch in text:
+            sym = self._char_to_keysym(ch)
+            await self._key(sym, True)
+            await self._key(sym, False)
+
+    async def press(self, key: str) -> None:
+        """Presiona y suelta una tecla por nombre (Enter, Tab, Escape…)."""
+        sym = self._keyname_to_keysym(key)
+        await self._key(sym, True)
+        await self._key(sym, False)
+
+    async def scroll(self, dy: int) -> None:
+        """Simula rueda del ratón: 4=arriba, 5=abajo."""
+        button = 4 if dy < 0 else 5
+        clicks = abs(dy) // 120 + 1
+        for _ in range(clicks):
+            await self._pointer(button, 0, 0)
+            await self._pointer(0, 0, 0)
+
+    # ------------------------------------------------------------------
+    # Helpers de red / protocolo
+    # ------------------------------------------------------------------
+
+    async def _send(self, data: bytes) -> None:
+        await self.ws.send(data)
+
+    async def _recv_exact(self, n: int) -> bytes:
         while len(self._buf) < n:
-            msg = await self.ws.recv()
-            if isinstance(msg, str):
-                msg = msg.encode("latin-1")
-            self._buf += msg
+            chunk = await self.ws.recv()
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8")
+            self._buf.extend(chunk)
         out = bytes(self._buf[:n])
         del self._buf[:n]
         return out
 
-    async def _send(self, data: bytes):
-        await self.ws.send(data)
+    async def _read_message(self):
+        """Lee un mensaje RFB y devuelve (type, payload).
 
-    # ---------- conexion ----------
-    async def connect(self, timeout: float = 20):
-        self.ws = await asyncio.wait_for(
-            websockets.connect(self.url, subprotocols=["binary"],
-                               max_size=None, open_timeout=timeout),
-            timeout + 5,
-        )
-        await asyncio.wait_for(self._handshake(), timeout)
+        Payload:
+          * type 0 → lista de rects [(x,y,w,h,enc,bytes), ...]
+          * type 2 → b''   (Bell, ignorado)
+          * type 3 → bytes (ServerCutText)
+        """
+        msg_type = (await self._recv_exact(1))[0]
 
-    async def _handshake(self):
-        ver = await self._read(12)
-        if not ver.startswith(b"RFB "):
-            raise RFBError(f"No es un servidor RFB: {ver!r}")
-        minor = int(ver[8:11])
-        if minor >= 8:
-            await self._send(b"RFB 003.008\n")
-        elif minor == 7:
-            await self._send(b"RFB 003.007\n")
-        else:
-            await self._send(b"RFB 003.003\n")
-
-        # seguridad
-        if minor >= 7:
-            n = (await self._read(1))[0]
-            if n == 0:
-                ln = struct.unpack(">I", await self._read(4))[0]
-                raise RFBError("Servidor rechaza: " + (await self._read(ln)).decode("latin-1"))
-            types = list(await self._read(n))
-            if 2 in types:
-                sec = 2
-            elif 1 in types:
-                sec = 1
-            else:
-                raise RFBError(f"Seguridad no soportada: {types}")
-            await self._send(bytes([sec]))
-        else:
-            sec = struct.unpack(">I", await self._read(4))[0]
-            if sec == 0:
-                raise RFBError("Conexion rechazada por el servidor")
-
-        if sec == 2:
-            challenge = await self._read(16)
-            resp = DES.new(_vnc_des_key(self._password), DES.MODE_ECB).encrypt(challenge)
-            await self._send(resp)
-        if sec == 2 or minor >= 8:
-            result = struct.unpack(">I", await self._read(4))[0]
-            if result != 0:
-                reason = ""
-                if minor >= 8:
-                    ln = struct.unpack(">I", await self._read(4))[0]
-                    reason = (await self._read(ln)).decode("latin-1")
-                raise RFBError("Autenticacion fallida (clave incorrecta?) " + reason)
-
-        await self._send(b"\x01")  # ClientInit: shared
-        w, h = struct.unpack(">HH", await self._read(4))
-        await self._read(16)  # pixel format del servidor (lo reemplazamos)
-        ln = struct.unpack(">I", await self._read(4))[0]
-        await self._read(ln)  # nombre del escritorio
-        self.width, self.height = w, h
-        self._fb = bytearray(w * h * 4)
-
-        # 32 bpp, color verdadero, little-endian: bytes B,G,R,X
-        await self._send(
-            struct.pack(">BxxxBBBBHHHBBBxxx", 0, 32, 24, 0, 1, 255, 255, 255, 16, 8, 0)
-        )
-        # solo codificacion Raw (0): la mas simple
-        await self._send(struct.pack(">BxHi", 2, 1, 0))
-
-    async def close(self):
-        try:
-            if self.ws:
-                await self.ws.close()
-        finally:
-            self.ws = None
-
-    # ---------- captura ----------
-    async def _request_update(self, incremental: bool = False):
-        await self._send(struct.pack(">BBHHHH", 3, 1 if incremental else 0,
-                                     0, 0, self.width, self.height))
-
-    async def _read_server_message(self) -> bool:
-        """Lee un mensaje del servidor. True si fue un FramebufferUpdate."""
-        mtype = (await self._read(1))[0]
-        if mtype == 0:
-            await self._read(1)
-            nrects = struct.unpack(">H", await self._read(2))[0]
-            for _ in range(nrects):
-                x, y, w, h, enc = struct.unpack(">HHHHi", await self._read(12))
+        if msg_type == 0:  # FramebufferUpdate
+            await self._recv_exact(1)                 # padding
+            num_rects = struct.unpack("!H", await self._recv_exact(2))[0]
+            rects = []
+            for _ in range(num_rects):
+                x, y, w, h, enc = struct.unpack(
+                    "!HHHHi", await self._recv_exact(12))
                 if enc != 0:
-                    raise RFBError(f"Codificacion inesperada: {enc}")
-                data = await self._read(w * h * 4)
-                for row in range(h):
-                    dst = ((y + row) * self.width + x) * 4
-                    self._fb[dst:dst + w * 4] = data[row * w * 4:(row + 1) * w * 4]
-            return True
-        if mtype == 1:  # SetColourMapEntries
-            await self._read(1)
-            _, n = struct.unpack(">HH", await self._read(4))
-            await self._read(n * 6)
-        elif mtype == 2:  # Bell
-            pass
-        elif mtype == 3:  # ServerCutText
-            await self._read(3)
-            ln = struct.unpack(">I", await self._read(4))[0]
-            await self._read(ln)
-        else:
-            raise RFBError(f"Mensaje de servidor desconocido: {mtype}")
-        return False
+                    raise Exception(f"Encoding {enc} no soportado")
+                data_len = w * h * 4  # 32 bpp = 4 bytes/pixel
+                data = await self._recv_exact(data_len)
+                rects.append((x, y, w, h, enc, data))
+            return 0, rects
 
-    async def screenshot(self, settle: float = 0.0, timeout: float = 15) -> bytes:
-        """Devuelve la pantalla como PNG. `settle` espera antes de capturar."""
-        if settle:
-            await asyncio.sleep(settle)
-        await self._request_update(incremental=False)
+        if msg_type == 2:  # Bell
+            return 2, b""
 
-        async def _wait():
-            while not await self._read_server_message():
-                pass
-        await asyncio.wait_for(_wait(), timeout)
-        img = Image.frombytes("RGB", (self.width, self.height), bytes(self._fb), "raw", "BGRX")
-        out = io.BytesIO()
-        img.save(out, "PNG")
-        return out.getvalue()
+        if msg_type == 3:  # ServerCutText
+            await self._recv_exact(3)  # padding
+            length = struct.unpack("!I", await self._recv_exact(4))[0]
+            return 3, await self._recv_exact(length)
 
-    # ---------- entrada ----------
-    async def _pointer(self, x: int, y: int, mask: int):
-        self._x, self._y, self._mask = x, y, mask
-        await self._send(struct.pack(">BBHH", 5, mask, x, y))
+        # Otros tipos no esperados en este reto
+        return msg_type, b""
 
-    async def move(self, x: int, y: int):
-        await self._pointer(x, y, 0)
+    async def _pointer(self, button: int, x: int, y: int) -> None:
+        """PointerEvent RFB: 1 byte botón + 2 x + 2 y."""
+        await self._send(struct.pack("!BBHH", 5, button, x, y))
 
-    async def click(self, x: int, y: int, button: int = 1):
-        bit = 1 << (button - 1)
-        await self._pointer(x, y, 0)
-        await asyncio.sleep(0.05)
-        await self._pointer(x, y, bit)
-        await asyncio.sleep(CLICK_HOLD)
-        await self._pointer(x, y, 0)
+    async def _key(self, keysym: int, down: bool) -> None:
+        """KeyEvent RFB: 1 tipo + 1 flag + 2 pad + 4 keysym."""
+        flag = 1 if down else 0
+        await self._send(struct.pack("!BBxxI", 4, flag, keysym))
 
-    async def double_click(self, x: int, y: int):
-        await self.click(x, y)
-        await asyncio.sleep(0.12)
-        await self.click(x, y)
+    # ------------------------------------------------------------------
+    # Mapeo de caracteres / teclas
+    # ------------------------------------------------------------------
 
-    async def scroll(self, x: int, y: int, dy: int):
-        """dy > 0 baja, dy < 0 sube (en pasos de rueda)."""
-        bit = 1 << (5 - 1) if dy > 0 else 1 << (4 - 1)
-        await self._pointer(x, y, 0)
-        for _ in range(abs(dy)):
-            await self._pointer(x, y, bit)
-            await asyncio.sleep(0.03)
-            await self._pointer(x, y, 0)
-            await asyncio.sleep(0.03)
+    @staticmethod
+    def _char_to_keysym(ch: str) -> int:
+        """Para caracteres Latin-1 el keysym coincide con el code point."""
+        return ord(ch)
 
-    async def _key(self, keysym: int, down: bool):
-        await self._send(struct.pack(">BBxxI", 4, 1 if down else 0, keysym))
-
-    async def press(self, combo: str):
-        """'enter', 'tab', 'ctrl+a', 'shift+tab'..."""
-        parts = [p.strip().lower() for p in combo.split("+")]
-        syms = [KEYSYMS[p] if p in KEYSYMS else char_keysym(p) for p in parts]
-        for s in syms:
-            await self._key(s, True)
-            await asyncio.sleep(0.03)
-        for s in reversed(syms):
-            await self._key(s, False)
-            await asyncio.sleep(0.03)
-
-    async def type_text(self, text: str, select_all: bool = True):
-        if select_all:
-            await self.press("ctrl+a")  # evita que el texto se concatene
-            await asyncio.sleep(0.1)
-        for ch in text:
-            s = char_keysym(ch)
-            await self._key(s, True)
-            await asyncio.sleep(0.015)
-            await self._key(s, False)
-            await asyncio.sleep(0.015)
+    @staticmethod
+    def _keyname_to_keysym(key: str) -> int:
+        """Mapea nombres comunes a keysyms X11."""
+        table = {
+            "Enter": 0xFF0D,
+            "Return": 0xFF0D,
+            "Tab": 0xFF09,
+            "Escape": 0xFF1B,
+            "Backspace": 0xFF08,
+            "Delete": 0xFFFF,
+            "Home": 0xFF50,
+            "End": 0xFF57,
+            "PageUp": 0xFF55,
+            "PageDown": 0xFF56,
+            "Left": 0xFF51,
+            "Up": 0xFF52,
+            "Right": 0xFF53,
+            "Down": 0xFF54,
+            "Control": 0xFFE3,
+            "Ctrl": 0xFFE3,
+            "Alt": 0xFFE9,
+            "Shift": 0xFFE1,
+            "Space": 0x20,
+        }
+        return table.get(key, ord(key[0]) if key else 0)
