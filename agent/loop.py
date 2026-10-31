@@ -4,6 +4,8 @@ agent/loop.py — Bucle principal de ejecución de tareas.
 ejecutar_tarea(tarea, ws_url, password):
   1. Conecta Desktop.
   2. Bucle: screenshot(settle=1.3) → decidir → ejecutar → repetir.
+     Una sola captura por turno: la tanda se corta tras el primer
+     click/double_click/scroll (lo de detrás se descarta y se anota).
   3. Si un turno trae acciones + done: ejecuta las acciones, descarta
      el done, toma captura nueva y vuelve a consultar.
      Solo se acepta done cuando va SOLO en el turno.
@@ -36,6 +38,9 @@ MAX_TAREA_SEG = 255          # 4 min 15 s
 MAX_PASOS = 50               # límite de iteraciones por tarea
 SETTLE = 1.3                 # segundos de espera tras cada acción
 STEP_TIMEOUT = 90.0          # máximo para una llamada al modelo
+# Acciones que pueden cambiar de pantalla: la tanda se corta después de ellas
+# y lo que venía detrás se descarta (apuntaría a una pantalla que ya no existe).
+CORTA_TANDA = {"click", "double_click", "scroll"}
 
 _SECRETOS_ENV = ["OPENROUTER_API_KEY", "EQUIPO_TOKEN"]
 
@@ -76,6 +81,17 @@ def _normalizar_respuesta(resumen: str, estado: str) -> str:
     if estado != "terminada" or not valor:
         return resto
     return f"{resto}\nrespuesta: {valor}" if resto else f"respuesta: {valor}"
+
+
+def _recortar_tanda(acciones: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Corta la tanda después de la primera acción de CORTA_TANDA.
+
+    Devuelve (a_ejecutar, descartadas). type/key/wait no cortan.
+    """
+    for i, accion in enumerate(acciones):
+        if accion.get("action") in CORTA_TANDA:
+            return acciones[: i + 1], acciones[i + 1:]
+    return acciones, []
 
 
 def _borrar_api_keys(texto: str) -> str:
@@ -179,6 +195,17 @@ async def ejecutar_tarea(
             else:
                 acciones_a_ejecutar = acciones
 
+            if acciones_a_ejecutar and acciones_a_ejecutar[0].get("action") != "done":
+                acciones_a_ejecutar, descartadas = _recortar_tanda(acciones_a_ejecutar)
+                if descartadas:
+                    historial.append({
+                        "nota": (
+                            f"turno cortado tras {acciones_a_ejecutar[-1].get('action')}: "
+                            f"{len(descartadas)} acciones posteriores NO se ejecutaron "
+                            "porque la pantalla pudo cambiar; decide de nuevo con la captura nueva"
+                        )
+                    })
+
             # 4. ejecutar secuencialmente
             for idx, accion in enumerate(acciones_a_ejecutar):
                 if estado != "en_curso":
@@ -207,7 +234,9 @@ async def ejecutar_tarea(
                 # ejecutar; una acción mal formada (tecla desconocida, campo
                 # faltante) se reporta al modelo y se corta el turno
                 try:
-                    await _ejecutar_accion(accion, desktop, _queda)
+                    # un wait al final sobra: la captura del turno ya espera SETTLE
+                    if not (es_ultima and accion.get("action") == "wait"):
+                        await _ejecutar_accion(accion, desktop, _queda)
                 except (ValueError, KeyError, TypeError) as exc:
                     historial.append({
                         "nota": f"acción inválida no ejecutada: {accion_str} ({exc})"
@@ -216,10 +245,6 @@ async def ejecutar_tarea(
                 _salvar_paso(captura, accion, accion_str)
                 historial.append(accion)
                 total_acciones_ejecutadas += 1
-
-                # screenshot después de cada acción para estabilizar
-                if accion.get("action") != "done":
-                    captura = await _screenshot()
 
                 if accion.get("action") == "done":
                     estado = accion.get("estado", "fallida")

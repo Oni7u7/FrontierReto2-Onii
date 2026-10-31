@@ -400,3 +400,44 @@ def test_fallida_nunca_lleva_linea_respuesta():
 def test_sin_respuesta_no_toca_el_resumen():
     s = "Se actualizó el teléfono a 3109998877."
     assert loop._normalizar_respuesta(s, "terminada") == s
+
+
+# ------------------------------------------------------------------
+# Test: una captura por turno y tanda cortada tras un click
+# ------------------------------------------------------------------
+
+def test_recortar_tanda():
+    t = [{"action": "type", "text": "a"}, {"action": "click", "x": 1, "y": 1},
+         {"action": "type", "text": "b"}]
+    assert loop._recortar_tanda(t) == (t[:2], t[2:])
+    sin_clic = [{"action": "type", "text": "a"}, {"action": "key", "key": "Tab"}]
+    assert loop._recortar_tanda(sin_clic) == (sin_clic, [])
+
+
+@pytest.mark.asyncio
+async def test_tanda_cortada_tras_click_y_una_captura_por_turno(mock_desktop):
+    historiales = []
+    turnos = iter([
+        [{"action": "click", "x": 10, "y": 10}, {"action": "type", "text": "no"},
+         {"action": "click", "x": 20, "y": 20}],
+        [{"action": "type", "text": "uno"}, {"action": "key", "key": "Tab"},
+         {"action": "type", "text": "dos"}, {"action": "wait"}],
+        [{"action": "done", "estado": "terminada", "resumen": "ok"}],
+    ])
+
+    async def _fake_decidir(tarea, captura, historial, *args, **kwargs):
+        historiales.append(json.dumps(historial, ensure_ascii=False))
+        return next(turnos, [{"action": "done", "estado": "terminada", "resumen": "ok"}])
+
+    with patch("agent.loop.Desktop", return_value=mock_desktop):
+        with patch("agent.loop.decidir", new=_fake_decidir):
+            with patch.object(loop, "SETTLE", 0.0):
+                await loop.ejecutar_tarea(
+                    task_id="T-tanda", tarea="x", ws_url="ws://mock:0", password="p")
+
+    assert [c.args for c in mock_desktop.click.await_args_list] == [(10, 10)]
+    tipeos = [c.args[0] for c in mock_desktop.type_text.await_args_list]
+    assert tipeos == ["uno", "dos"]
+    assert "2 acciones posteriores NO se ejecutaron" in historiales[1]
+    # 3 turnos del bucle → 3 capturas (más, como mucho, la de la verificación final)
+    assert mock_desktop.screenshot.await_count <= 4
