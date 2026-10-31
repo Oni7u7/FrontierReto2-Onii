@@ -1,0 +1,4 @@
+[001] {'action': 'click', 'x': 200, 'y': 300} -> {"action": "click", "x": 200, "y": 300}
+[002] {'action': 'done', 'estado': 'terminada', 'resumen': 'Confirmado'} -> {"action": "done", "estado": "terminada", "resumen": "Confirmado"}
+[001] {'action': 'click', 'x': 200, 'y': 300} -> {"action": "click", "x": 200, "y": 300}
+[002] {'action': 'done', 'estado': 'terminada', 'resumen': 'Confirmado'} -> {"action": "done", "estado": "terminada", "resumen": "Confirmado"}

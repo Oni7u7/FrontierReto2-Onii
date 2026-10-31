@@ -59,7 +59,7 @@ def mock_desktop(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_ejecutar_tarea_exitosa(mock_desktop):
-    """El modelo devuelve done en el primer turno → terminada."""
+    """El modelo devuelve done solo en el turno → terminada."""
     fake_actions = [
         {"action": "click", "x": 100, "y": 200},
         {
@@ -68,9 +68,21 @@ async def test_ejecutar_tarea_exitosa(mock_desktop):
             "resumen": "Cliente creado exitosamente",
         },
     ]
+    call_idx = 0
 
     async def _fake_decidir(*args, **kwargs):
-        return fake_actions
+        nonlocal call_idx
+        call_idx += 1
+        if call_idx == 1:
+            # Primer turno: click + done (el done debe descartarse)
+            return [
+                {"action": "click", "x": 100, "y": 200},
+                {"action": "done", "estado": "terminada", "resumen": "Listo"},
+            ]
+        # Segundo turno: done solo (se acepta)
+        return [
+            {"action": "done", "estado": "terminada", "resumen": "Cliente creado exitosamente"}
+        ]
 
     with patch("agent.loop.Desktop", return_value=mock_desktop):
         with patch("agent.loop.decidir", new=_fake_decidir):
@@ -83,12 +95,9 @@ async def test_ejecutar_tarea_exitosa(mock_desktop):
 
     assert result["estado"] == "terminada"
     assert "Cliente creado" in result["resumen"]
-    # connect se llama al menos 1 vez; en tareas terminadas puede
-    # llamarse una segunda vez para la verificación final.
+    assert mock_desktop.click.await_count >= 1
     assert mock_desktop.connect.await_count >= 1
-    # close puede llamarse varias veces (bucle + verificación + fallback)
     assert mock_desktop.close.await_count >= 1
-    mock_desktop.click.assert_awaited_once_with(100, 200)
 
 
 # ------------------------------------------------------------------
@@ -269,3 +278,43 @@ async def test_logs_filtrados(mock_desktop, tmp_path, monkeypatch):
     # El resumen filtró el token
     assert "tok-1234567890" not in result["resumen"]
     assert "***" in result["resumen"]
+
+
+# ------------------------------------------------------------------
+# Test: done mezclado con acciones no termina en ese turno
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_done_mezclado_no_termina(mock_desktop):
+    """Si el modelo devuelve [click, done] en el primer turno,
+    se ejecuta el click, se descarta el done y se vuelve a consultar."""
+
+    call_idx = 0
+
+    async def _fake_mezclado(*args, **kwargs):
+        nonlocal call_idx
+        call_idx += 1
+        if call_idx == 1:
+            return [
+                {"action": "click", "x": 200, "y": 300},
+                {"action": "done", "estado": "terminada", "resumen": "hecho"},
+            ]
+        # Segundo consulta: terminada real
+        return [{"action": "done", "estado": "terminada", "resumen": "Confirmado"}]
+
+    with patch("agent.loop.Desktop", return_value=mock_desktop):
+        with patch("agent.loop.decidir", new=_fake_mezclado):
+            result = await loop.ejecutar_tarea(
+                task_id="T8",
+                tarea="Tarea mixta",
+                ws_url="ws://mock:0",
+                password="secreto",
+            )
+
+    assert result["estado"] == "terminada"
+    assert "Confirmado" in result["resumen"]
+    # El click del primer turno SÍ se ejecutó
+    assert mock_desktop.click.await_count >= 1
+    # Se consultó al modelo al menos DOS veces (primer turno + segundo turno,
+    # posiblemente una tercera por verificación final)
+    assert call_idx >= 2

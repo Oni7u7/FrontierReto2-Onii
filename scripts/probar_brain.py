@@ -2,6 +2,7 @@
 import asyncio
 import os
 import sys
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -63,8 +64,11 @@ async def main():
     print(f"📝 Tarea: {tarea}")
 
     try:
+        t0 = time.monotonic()
         acciones = await decidir(tarea, imagen, [])
-        print(f"\n✅ Acciones recibidas ({len(acciones)}):")
+        dt = time.monotonic() - t0
+        print(f"\n⏱️  Tiempo de respuesta del modelo: {dt:.1f}s")
+        print(f"✅ Acciones recibidas ({len(acciones)}):")
         for i, a in enumerate(acciones, 1):
             print(f"   {i}. {a}")
     except Exception as exc:

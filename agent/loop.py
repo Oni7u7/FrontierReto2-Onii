@@ -4,11 +4,15 @@ agent/loop.py — Bucle principal de ejecución de tareas.
 ejecutar_tarea(tarea, ws_url, password):
   1. Conecta Desktop.
   2. Bucle: screenshot(settle=1.3) → decidir → ejecutar → repetir.
-  3. Límite duro 4 m 15 s (255 s).
-  4. Detección de bucles (misma acción + screenshot igual ×3).
-  5. Filtro de secretos en resumen y logs.
-  6. Verificación final opcional (conservadora: no invierte terminada).
-  7. Al terminar o fallar cierra Desktop inmediatamente.
+  3. Si un turno trae acciones + done: ejecuta las acciones, descarta
+     el done, toma captura nueva y vuelve a consultar.
+     Solo se acepta done cuando va SOLO en el turno.
+     Excepción: done con estado fallida y sin acciones previas se acepta.
+  4. Límite duro 4 m 15 s (255 s).
+  5. Detección de bucles (misma acción + screenshot igual ×3).
+  6. Filtro de secretos en resumen y logs.
+  7. Verificación final opcional (conservadora: no invierte terminada).
+  8. Al terminar o fallar cierra Desktop inmediatamente.
 """
 
 import asyncio
@@ -41,7 +45,6 @@ def _filtrar_secretos(texto: str) -> str:
         valor = os.getenv(nombre)
         if valor and valor in texto:
             texto = texto.replace(valor, "***")
-    # Además, cualquier clave API-like genérica
     texto = _borrar_api_keys(texto)
     return texto
 
@@ -74,10 +77,10 @@ async def ejecutar_tarea(
     start = time.monotonic()
     historial: list[dict] = []
     paso = 0
+    total_acciones_ejecutadas = 0
 
     # Para detección de bucles
     ultima_accion_json: str | None = None
-    ultimos_hashes: list[str] = []
     repeticiones_bucle = 0
 
     estado = "en_curso"
@@ -131,20 +134,50 @@ async def ejecutar_tarea(
             # 2. decidir
             acciones = await _decidir(captura)
 
-            # 3. ejecutar secuencialmente
-            for accion in acciones:
+            # 3. separar done del resto
+            done_actions = [a for a in acciones if a.get("action") == "done"]
+            otras_acciones = [a for a in acciones if a.get("action") != "done"]
+
+            # Si hay done mezclado con otras acciones, descartamos el done
+            # y ejecutamos solo las otras (luego captura nueva y reconsulta)
+            if done_actions and otras_acciones:
+                done = done_actions[0]
+                # Ejecutamos solo las acciones reales
+                acciones_a_ejecutar = otras_acciones
+                # Nota en historial para el modelo
+                historial.append({
+                    "nota": "done descartado: había acciones sin ejecutar, se ejecutaron primero"
+                })
+                # No procesamos el done ahora; el bucle continuará
+                procesar_done_ahora = False
+            elif done_actions and not otras_acciones:
+                # done va SOLO en el turno → lo aceptamos
+                # Excepción: siempre aceptamos done fallida (incluso sin acciones previas)
+                done = done_actions[0]
+                acciones_a_ejecutar = [done]
+                procesar_done_ahora = True
+            else:
+                # No hay done en este turno
+                acciones_a_ejecutar = acciones
+                procesar_done_ahora = False
+
+            # 4. ejecutar secuencialmente
+            for idx, accion in enumerate(acciones_a_ejecutar):
                 if estado != "en_curso":
                     break
 
                 accion_str = json.dumps(accion, ensure_ascii=False)
 
-                # detección de bucle
-                if accion == acciones[-1] and accion.get("action") != "done":
+                # detección de bucle: solo la ÚLTIMA acción del turno
+                # (como en la versión anterior, para que [click, wait]
+                #  no se cancele por click sino por wait)
+                es_ultima = (idx == len(acciones_a_ejecutar) - 1)
+                if es_ultima and accion.get("action") != "done":
                     h = hashlib.sha256(captura).hexdigest()[:16]
                     act_hash = f"{accion_str}_{h}"
                     if act_hash == ultima_accion_json:
                         repeticiones_bucle += 1
-                        if repeticiones_bucle >= 2:  # 3 veces en total (0,1,2)
+                        if repeticiones_bucle >= 2:  # 3 veces en total
                             estado = "fallida"
                             resumen = (
                                 "La tarea entró en bucle: la pantalla y las acciones "
@@ -158,6 +191,8 @@ async def ejecutar_tarea(
                 # ejecutar
                 await _ejecutar_accion(accion, desktop, _queda)
                 _salvar_paso(captura, accion, accion_str)
+                historial.append(accion)
+                total_acciones_ejecutadas += 1
 
                 # screenshot después de cada acción para estabilizar
                 if accion.get("action") != "done":
@@ -167,6 +202,9 @@ async def ejecutar_tarea(
                     estado = accion.get("estado", "fallida")
                     resumen = accion.get("resumen", "")
                     break
+
+            # Si descartamos un done, ya tomamos captura tras la última acción
+            # (el bucle continúa con una consulta fresca)
 
         # ---------- post-bucle ----------
         if estado == "en_curso":
@@ -187,10 +225,8 @@ async def ejecutar_tarea(
 
     # ---------- verificación final (conservadora) ----------
     if estado == "terminada":
-        # Solo si queda tiempo suficiente
         if _queda() > 10.0 and os.getenv("OPENROUTER_API_KEY"):
             try:
-                # Captura final
                 desktop2 = Desktop(ws_url, password)
                 await asyncio.wait_for(desktop2.connect(), timeout=10.0)
                 final_img = await asyncio.wait_for(
@@ -206,14 +242,12 @@ async def ejecutar_tarea(
                     timeout=min(STEP_TIMEOUT, max(5.0, _queda())),
                 )
                 await desktop2.close()
-                # Conservador: solo marcamos fallida si el modelo dice explícitamente ok:false
                 if verif and verif[-1].get("action") == "done":
                     verif_resumen = verif[-1].get("resumen", "")
                     if "ok: false" in verif_resumen.lower() or '"ok": false' in verif_resumen.lower():
                         estado = "fallida"
                         resumen = f"Verificación final indicó que la tarea no quedó completa: {verif_resumen}"
             except Exception:
-                # Si la verificación falla por red/VNC/modelo, mantenemos terminada
                 pass
             finally:
                 try:
@@ -248,6 +282,6 @@ async def _ejecutar_accion(
     elif tipo == "wait":
         await asyncio.sleep(SETTLE)
     elif tipo == "done":
-        pass  # se maneja en el bucle superior
+        pass
     else:
         raise ValueError(f"Acción desconocida: {tipo}")
