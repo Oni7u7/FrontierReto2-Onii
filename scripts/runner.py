@@ -7,13 +7,15 @@ Para cada JSON:
   4. POST /__check con el JSON de la prueba
   5. Muestra tabla de resultados
 
+Lee la configuración de .env: ESCRITORIO_WS (wss://.../websockify, tal cual),
+ESCRITORIO_PASSWORD, ESCRITORIO_TOKEN, EQUIPO_TOKEN y opcional AGENTE_URL.
+La URL https para /__reset y /__check se deriva de ESCRITORIO_WS.
+
+Además de /__check (estado de la app) evalúa localmente lo que el evaluador
+mira aparte: estado esperado, línea "respuesta:", claves_razon y secretos.
+
 Uso:
-    export ESCRITORIO_URL=...
-    export ESCRITORIO_TOKEN=...
-    export ESCRITORIO_PASSWORD=...
-    export EQUIPO_TOKEN=...
-    export AGENTE_URL=http://127.0.0.1:8000
-    python scripts/runner.py
+    python scripts/runner.py [E1 E3 ...]   # sin argumentos corre todas
 """
 import asyncio
 import json
@@ -22,12 +24,33 @@ import sys
 import time
 from pathlib import Path
 
+import re
+
 import httpx
+from dotenv import load_dotenv
+
+ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(ROOT / ".env")
 
 PRUEBAS = Path(__file__).resolve().parent.parent / "pruebas"
 
+
+
+def base_https(ws_url: str) -> str:
+    """wss://host/ruta/websockify -> https://host/ruta (ws:// -> http://)."""
+    url = ws_url.strip().rstrip("/")
+    if url.startswith("wss://"):
+        url = "https://" + url[len("wss://"):]
+    elif url.startswith("ws://"):
+        url = "http://" + url[len("ws://"):]
+    if url.endswith("/websockify"):
+        url = url[: -len("/websockify")]
+    return url.rstrip("/")
+
+
 AGENTE_URL = os.getenv("AGENTE_URL", "http://127.0.0.1:8000")
-ESCRITORIO_URL = os.getenv("ESCRITORIO_URL", "").rstrip("/")
+ESCRITORIO_WS = os.getenv("ESCRITORIO_WS", "")
+ESCRITORIO_URL = base_https(ESCRITORIO_WS) if ESCRITORIO_WS else ""
 ESCRITORIO_TOKEN = os.getenv("ESCRITORIO_TOKEN", "")
 ESCRITORIO_PASSWORD = os.getenv("ESCRITORIO_PASSWORD", "")
 EQUIPO_TOKEN = os.getenv("EQUIPO_TOKEN", "")
@@ -37,7 +60,7 @@ POLL_INTERVAL = 5   # segundos entre consultas (igual que el evaluador)
 
 def _check_env():
     missing = []
-    for name in ("ESCRITORIO_URL", "ESCRITORIO_TOKEN", "ESCRITORIO_PASSWORD", "EQUIPO_TOKEN"):
+    for name in ("ESCRITORIO_WS", "ESCRITORIO_TOKEN", "ESCRITORIO_PASSWORD", "EQUIPO_TOKEN"):
         if not os.getenv(name):
             missing.append(name)
     if missing:
@@ -63,7 +86,7 @@ async def _send_task(client: httpx.AsyncClient, instruccion: str) -> str:
         json={
             "tarea": instruccion,
             "escritorio": {
-                "url": f"{ESCRITORIO_URL}/websockify",
+                "url": ESCRITORIO_WS,
                 "password": ESCRITORIO_PASSWORD,
             },
         },
@@ -100,15 +123,48 @@ async def _check(client: httpx.AsyncClient, prueba: dict) -> dict:
     return r.json()
 
 
+def _primer_numero(texto: str) -> str | None:
+    m = re.search(r"-?\d+(?:[.,]\d+)?", texto)
+    return m.group(0).replace(",", ".") if m else None
+
+
+def evaluar_agente(prueba: dict, estado: str, resumen: str, password: str) -> list[dict]:
+    """Chequeos sobre estado y resumen, imitando las reglas del README."""
+    checks = [{"nombre": "estado esperado", "ok": estado == prueba.get("estado_esperado")}]
+    lineas = [l.strip() for l in resumen.splitlines()
+              if l.strip().lower().startswith("respuesta:")]
+    esperada = prueba.get("respuesta_esperada")
+    if esperada is not None:
+        ok = False
+        if lineas:
+            valor = lineas[0].split(":", 1)[1].strip()
+            num = _primer_numero(esperada)
+            if num is not None and re.fullmatch(r"-?\d+(?:[.,]\d+)?", esperada.strip()):
+                ok = _primer_numero(valor) == num
+            else:
+                ok = valor.lower() == esperada.strip().lower()
+        checks.append({"nombre": "línea respuesta", "ok": ok})
+    elif prueba.get("estado_esperado") == "fallida":
+        checks.append({"nombre": "sin línea respuesta", "ok": not lineas})
+    if prueba.get("claves_razon"):
+        checks.append({"nombre": "claves de la razón",
+                       "ok": all(k in resumen for k in prueba["claves_razon"])})
+    checks.append({"nombre": "sin secretos en resumen",
+                   "ok": not (password and password in resumen)})
+    return checks
+
+
 async def main():
     _check_env()
-    archivos = sorted(PRUEBAS.glob("*.json"))
+    filtro = {a.upper() for a in sys.argv[1:]}
+    archivos = [f for f in sorted(PRUEBAS.glob("*.json"))
+                if not filtro or f.name.split("-")[0].upper() in filtro]
     if not archivos:
         print("❌ No hay archivos JSON en pruebas/")
         sys.exit(1)
 
     resultados: list[dict] = []
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=60) as client:
         for fichero in archivos:
             print(f"\n{'='*60}")
             print(f"📄 {fichero.name}")
@@ -150,8 +206,9 @@ async def main():
             # 4. Check
             print("🔍 Verificando contra /__check...")
             check = await _check(client, prueba)
-            check_pass = check.get("pass", False)
-            checks = check.get("checks", [])
+            checks = check.get("checks", []) + evaluar_agente(
+                prueba, estado_agente, resumen_agente, ESCRITORIO_PASSWORD)
+            check_pass = check.get("pass", False) and all(c["ok"] for c in checks)
             for c in checks:
                 icon = "✅" if c["ok"] else "❌"
                 print(f"   {icon} {c['nombre']}: {'OK' if c['ok'] else 'FAIL'}")
