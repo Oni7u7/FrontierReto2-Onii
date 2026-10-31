@@ -179,8 +179,15 @@ async def ejecutar_tarea(
                         repeticiones_bucle = 0
                         ultima_accion_json = act_hash
 
-                # ejecutar
-                await _ejecutar_accion(accion, desktop, _queda)
+                # ejecutar; una acción mal formada (tecla desconocida, campo
+                # faltante) se reporta al modelo y se corta el turno
+                try:
+                    await _ejecutar_accion(accion, desktop, _queda)
+                except (ValueError, KeyError, TypeError) as exc:
+                    historial.append({
+                        "nota": f"acción inválida no ejecutada: {accion_str} ({exc})"
+                    })
+                    break
                 _salvar_paso(captura, accion, accion_str)
                 historial.append(accion)
                 total_acciones_ejecutadas += 1
@@ -269,7 +276,12 @@ async def _ejecutar_accion(
     elif tipo == "key":
         await desktop.press(accion["key"])
     elif tipo == "scroll":
-        await desktop.scroll(accion["dy"])
+        # sin x,y el scroll cae en el centro de la pantalla
+        await desktop.scroll(
+            accion.get("x", desktop.width // 2 or 640),
+            accion.get("y", desktop.height // 2 or 400),
+            accion["dy"],
+        )
     elif tipo == "wait":
         await asyncio.sleep(SETTLE)
     elif tipo == "done":

@@ -318,3 +318,53 @@ async def test_done_mezclado_no_termina(mock_desktop):
     # Se consultó al modelo al menos DOS veces (primer turno + segundo turno,
     # posiblemente una tercera por verificación final)
     assert call_idx >= 2
+
+
+# ------------------------------------------------------------------
+# Test: scroll(x, y, dy) y acciones inválidas
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_scroll_pasa_xy_y_usa_centro_por_defecto(mock_desktop):
+    turnos = iter([
+        [{"action": "scroll", "x": 300, "y": 500, "dy": 240}],
+        [{"action": "scroll", "dy": -120}],
+        [{"action": "done", "estado": "terminada", "resumen": "ok"}],
+    ])
+
+    async def _fake_decidir(*args, **kwargs):
+        return next(turnos, [{"action": "done", "estado": "terminada", "resumen": "ok"}])
+
+    with patch("agent.loop.Desktop", return_value=mock_desktop):
+        with patch("agent.loop.decidir", new=_fake_decidir):
+            await loop.ejecutar_tarea(
+                task_id="T-scroll", tarea="x", ws_url="ws://mock:0", password="p"
+            )
+
+    llamadas = [c.args for c in mock_desktop.scroll.await_args_list]
+    assert llamadas[:2] == [(300, 500, 240), (640, 400, -120)]
+
+
+@pytest.mark.asyncio
+async def test_accion_invalida_se_reporta_al_modelo_sin_matar_la_tarea(mock_desktop):
+    mock_desktop.press = AsyncMock(side_effect=ValueError("Tecla desconocida: 'Intro'"))
+    historiales = []
+    turnos = iter([
+        [{"action": "key", "key": "Intro"}, {"action": "click", "x": 1, "y": 1}],
+        [{"action": "done", "estado": "terminada", "resumen": "ok"}],
+    ])
+
+    async def _fake_decidir(tarea, captura, historial, *args, **kwargs):
+        historiales.append(json.dumps(historial, ensure_ascii=False))
+        return next(turnos, [{"action": "done", "estado": "terminada", "resumen": "ok"}])
+
+    with patch("agent.loop.Desktop", return_value=mock_desktop):
+        with patch("agent.loop.decidir", new=_fake_decidir):
+            result = await loop.ejecutar_tarea(
+                task_id="T-invalida", tarea="x", ws_url="ws://mock:0", password="p"
+            )
+
+    assert result["estado"] == "terminada"
+    assert "acción inválida" in historiales[1] and "Intro" in historiales[1]
+    # el turno se corta: el click posterior a la acción inválida no se ejecuta
+    assert mock_desktop.click.await_count == 0

@@ -19,6 +19,51 @@ import websockets
 from PIL import Image
 from Crypto.Cipher import DES
 
+# El escritorio ignora clics con menos de 100 ms entre bajar y soltar.
+CLICK_HOLD = 0.13
+# Pausa entre los dos clics de un doble clic (debe quedar bajo ~500 ms en total).
+DOUBLE_CLICK_GAP = 0.06
+
+# Nombres de tecla (en minúsculas) → keysym X11.
+KEYSYMS = {
+    "enter": 0xFF0D,
+    "return": 0xFF0D,
+    "tab": 0xFF09,
+    "escape": 0xFF1B,
+    "esc": 0xFF1B,
+    "backspace": 0xFF08,
+    "delete": 0xFFFF,
+    "del": 0xFFFF,
+    "insert": 0xFF63,
+    "home": 0xFF50,
+    "end": 0xFF57,
+    "pageup": 0xFF55,
+    "pagedown": 0xFF56,
+    "left": 0xFF51,
+    "up": 0xFF52,
+    "right": 0xFF53,
+    "down": 0xFF54,
+    "control": 0xFFE3,
+    "ctrl": 0xFFE3,
+    "alt": 0xFFE9,
+    "shift": 0xFFE1,
+    "super": 0xFFEB,
+    "meta": 0xFFEB,
+    "space": 0x20,
+    **{f"f{i}": 0xFFBE + i - 1 for i in range(1, 13)},
+}
+
+
+def char_keysym(ch: str) -> int:
+    """Keysym de un carácter: Latin-1 coincide con el code point; el resto
+    de Unicode usa 0x01000000 + code point (convención X11)."""
+    if ch == "\n":
+        return KEYSYMS["enter"]
+    if ch == "\t":
+        return KEYSYMS["tab"]
+    cp = ord(ch)
+    return cp if cp <= 0xFF else 0x01000000 + cp
+
 
 def _vnc_des_key(password: str) -> bytes:
     """Deriva la clave DES de 8 bytes que exige el auth VNC.
@@ -52,7 +97,10 @@ class Desktop:
 
     async def connect(self) -> None:
         """Handshake RFB 3.8 + VNC auth + inicialización."""
-        self.ws = await websockets.connect(self.url, subprotocols=["binary"])
+        # max_size=None: un frame de pantalla completa puede pasar de 1 MB.
+        self.ws = await websockets.connect(
+            self.url, subprotocols=["binary"], max_size=None
+        )
 
         # 1. Versión
         await self._send(b"RFB 003.008\n")
@@ -63,18 +111,21 @@ class Desktop:
         if num_types == 0:
             raise Exception("No security types offered")
         types = await self._recv_exact(num_types)
-        if 2 not in types:
-            raise Exception("VNC auth (type 2) not offered")
-        await self._send(b"\x02")  # Elegimos VNC auth
+        if 2 in types:
+            await self._send(b"\x02")  # VNC auth (contraseña)
 
-        # 3. VNC authentication
-        challenge = await self._recv_exact(16)
-        key = _vnc_des_key(self.password)
-        cipher = DES.new(key, DES.MODE_ECB)
-        response = cipher.encrypt(challenge)
-        await self._send(response)
+            # 3. VNC authentication
+            challenge = await self._recv_exact(16)
+            key = _vnc_des_key(self.password)
+            cipher = DES.new(key, DES.MODE_ECB)
+            response = cipher.encrypt(challenge)
+            await self._send(response)
+        elif 1 in types:
+            await self._send(b"\x01")  # None: sin contraseña
+        else:
+            raise Exception(f"Tipos de seguridad no soportados: {list(types)}")
 
-        # 4. Auth result (big-endian según RFB)
+        # 4. Auth result (big-endian según RFB; en 3.8 también llega con None)
         result = struct.unpack("!I", await self._recv_exact(4))[0]
         if result != 0:
             reason_len = struct.unpack("!I", await self._recv_exact(4))[0]
@@ -143,34 +194,28 @@ class Desktop:
                 rects = payload
                 break
 
-        # Construir imagen RGB
+        # Construir imagen RGB: Pillow decodifica BGRX crudo directamente
         img = Image.new("RGB", (self.width, self.height))
         for x, y, w, h, _enc, pixels in rects:
-            # Convertir BGRX crudo → RGB
-            row_rgb = bytearray()
-            for row in range(h):
-                row_start = row * w * 4
-                for col in range(w):
-                    p = row_start + col * 4
-                    b, g, r = pixels[p], pixels[p + 1], pixels[p + 2]
-                    row_rgb.extend((r, g, b))
-                # dibujar fila entera de una vez
-                row_img = Image.frombytes("RGB", (w, 1), bytes(row_rgb[-w * 3:]))
-                img.paste(row_img, (x, y + row))
+            if w == 0 or h == 0:
+                continue
+            img.paste(Image.frombytes("RGB", (w, h), pixels, "raw", "BGRX"), (x, y))
 
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return buf.getvalue()
 
     async def click(self, x: int, y: int) -> None:
-        """Clic izquierdo: move + down + up."""
+        """Clic izquierdo: move + down + pausa CLICK_HOLD + up."""
         await self._pointer(0, x, y)   # move (sin botón)
         await self._pointer(1, x, y)   # botón izquierdo presionado
+        await asyncio.sleep(CLICK_HOLD)
         await self._pointer(0, x, y)   # botón soltado
 
     async def double_click(self, x: int, y: int) -> None:
-        """Doble clic: dos clics seguidos."""
+        """Doble clic: dos clics con una pausa corta entre ellos."""
         await self.click(x, y)
+        await asyncio.sleep(DOUBLE_CLICK_GAP)
         await self.click(x, y)
 
     async def type_text(self, text: str, select_all: bool = True) -> None:
@@ -182,23 +227,35 @@ class Desktop:
             await self._key(0xFFE3, False)  # Ctrl  up
 
         for ch in text:
-            sym = self._char_to_keysym(ch)
+            sym = char_keysym(ch)
             await self._key(sym, True)
             await self._key(sym, False)
 
     async def press(self, key: str) -> None:
-        """Presiona y suelta una tecla por nombre (Enter, Tab, Escape…)."""
-        sym = self._keyname_to_keysym(key)
-        await self._key(sym, True)
-        await self._key(sym, False)
+        """Presiona una tecla o combo ("Enter", "ctrl+a", "shift+Tab").
 
-    async def scroll(self, dy: int) -> None:
-        """Simula rueda del ratón: 4=arriba, 5=abajo."""
-        button = 4 if dy < 0 else 5
-        clicks = abs(dy) // 120 + 1
-        for _ in range(clicks):
-            await self._pointer(button, 0, 0)
-            await self._pointer(0, 0, 0)
+        Baja las partes en orden y las suelta en orden inverso.
+        """
+        syms = [self._keyname_to_keysym(part) for part in key.split("+")]
+        for sym in syms:
+            await self._key(sym, True)
+        for sym in reversed(syms):
+            await self._key(sym, False)
+
+    async def scroll(self, x: int, y: int, dy: int) -> None:
+        """Rueda del ratón sobre (x, y): dy<0 sube (botón 4), dy>0 baja (5).
+
+        La rueda actúa sobre el elemento bajo el puntero, por eso se mueve
+        primero a (x, y). Cada 120 de dy es un paso de rueda (mínimo 1).
+        """
+        if dy == 0:
+            return
+        mask = 8 if dy < 0 else 16   # bit 3 = botón 4, bit 4 = botón 5
+        steps = max(1, abs(dy) // 120)
+        await self._pointer(0, x, y)
+        for _ in range(steps):
+            await self._pointer(mask, x, y)
+            await self._pointer(0, x, y)
 
     # ------------------------------------------------------------------
     # Helpers de red / protocolo
@@ -266,32 +323,13 @@ class Desktop:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _char_to_keysym(ch: str) -> int:
-        """Para caracteres Latin-1 el keysym coincide con el code point."""
-        return ord(ch)
-
-    @staticmethod
     def _keyname_to_keysym(key: str) -> int:
-        """Mapea nombres comunes a keysyms X11."""
-        table = {
-            "Enter": 0xFF0D,
-            "Return": 0xFF0D,
-            "Tab": 0xFF09,
-            "Escape": 0xFF1B,
-            "Backspace": 0xFF08,
-            "Delete": 0xFFFF,
-            "Home": 0xFF50,
-            "End": 0xFF57,
-            "PageUp": 0xFF55,
-            "PageDown": 0xFF56,
-            "Left": 0xFF51,
-            "Up": 0xFF52,
-            "Right": 0xFF53,
-            "Down": 0xFF54,
-            "Control": 0xFFE3,
-            "Ctrl": 0xFFE3,
-            "Alt": 0xFFE9,
-            "Shift": 0xFFE1,
-            "Space": 0x20,
-        }
-        return table.get(key, ord(key[0]) if key else 0)
+        """Nombre de tecla ("Enter", "ctrl") o carácter suelto ("a") → keysym."""
+        name = key.strip()
+        sym = KEYSYMS.get(name.lower().replace("_", ""))
+        if sym is not None:
+            return sym
+        if len(name) == 1:
+            # Combos con letra: usar minúscula para que Ctrl+A no lleve Shift implícito
+            return char_keysym(name.lower())
+        raise ValueError(f"Tecla desconocida: {key!r}")

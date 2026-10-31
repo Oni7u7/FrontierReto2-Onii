@@ -41,7 +41,7 @@ FORMATO DE RESPUESTA — SOLO un array JSON, sin texto adicional, sin markdown:
   {"action": "click", "x": 640, "y": 400},
   {"action": "type", "text": "Papelería Los Andes", "select_all": true},
   {"action": "key", "key": "Enter"},
-  {"action": "scroll", "dy": -300},
+  {"action": "scroll", "x": 640, "y": 400, "dy": -300},
   {"action": "wait"},
   {"action": "done", "estado": "terminada", "resumen": "Se registró el cliente Papelería Los Andes con NIT 901234567. respuesta: 45"}
 ]
@@ -50,8 +50,8 @@ Acciones válidas:
 - click      → {action:"click", x:int, y:int}
 - double_click → {action:"double_click", x:int, y:int}
 - type       → {action:"type", text:string, select_all:bool}
-- key        → {action:"key", key:string}  (Enter, Tab, Escape, etc.)
-- scroll     → {action:"scroll", dy:int}
+- key        → {action:"key", key:string}  (Enter, Tab, Escape, o combos como "ctrl+a", "shift+Tab")
+- scroll     → {action:"scroll", x:int, y:int, dy:int}  (x,y = sobre la lista/panel a desplazar; dy<0 sube, dy>0 baja, 120 = un paso de rueda)
 - wait       → {action:"wait"}
 - done       → {action:"done", estado:"terminada"|"fallida", resumen:string}
 
