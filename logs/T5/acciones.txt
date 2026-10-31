@@ -119,3 +119,18 @@
 [002] {'action': 'click', 'x': 50, 'y': 50} -> {"action": "click", "x": 50, "y": 50}
 [002] {'action': 'wait'} -> {"action": "wait"}
 [003] {'action': 'click', 'x': 50, 'y': 50} -> {"action": "click", "x": 50, "y": 50}
+[001] {'action': 'click', 'x': 50, 'y': 50} -> {"action": "click", "x": 50, "y": 50}
+[001] {'action': 'wait'} -> {"action": "wait"}
+[002] {'action': 'click', 'x': 50, 'y': 50} -> {"action": "click", "x": 50, "y": 50}
+[002] {'action': 'wait'} -> {"action": "wait"}
+[003] {'action': 'click', 'x': 50, 'y': 50} -> {"action": "click", "x": 50, "y": 50}
+[001] {'action': 'click', 'x': 50, 'y': 50} -> {"action": "click", "x": 50, "y": 50}
+[001] {'action': 'wait'} -> {"action": "wait"}
+[002] {'action': 'click', 'x': 50, 'y': 50} -> {"action": "click", "x": 50, "y": 50}
+[002] {'action': 'wait'} -> {"action": "wait"}
+[003] {'action': 'click', 'x': 50, 'y': 50} -> {"action": "click", "x": 50, "y": 50}
+[001] {'action': 'click', 'x': 50, 'y': 50} -> {"action": "click", "x": 50, "y": 50}
+[001] {'action': 'wait'} -> {"action": "wait"}
+[002] {'action': 'click', 'x': 50, 'y': 50} -> {"action": "click", "x": 50, "y": 50}
+[002] {'action': 'wait'} -> {"action": "wait"}
+[003] {'action': 'click', 'x': 50, 'y': 50} -> {"action": "click", "x": 50, "y": 50}

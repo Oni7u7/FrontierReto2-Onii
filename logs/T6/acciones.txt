@@ -15,3 +15,12 @@
 [001] {'action': 'click', 'x': 1, 'y': 1} -> {"action": "click", "x": 1, "y": 1}
 [002] {'action': 'click', 'x': 2, 'y': 2} -> {"action": "click", "x": 2, "y": 2}
 [003] {'action': 'click', 'x': 3, 'y': 3} -> {"action": "click", "x": 3, "y": 3}
+[001] {'action': 'click', 'x': 1, 'y': 1} -> {"action": "click", "x": 1, "y": 1}
+[002] {'action': 'click', 'x': 2, 'y': 2} -> {"action": "click", "x": 2, "y": 2}
+[003] {'action': 'click', 'x': 3, 'y': 3} -> {"action": "click", "x": 3, "y": 3}
+[001] {'action': 'click', 'x': 1, 'y': 1} -> {"action": "click", "x": 1, "y": 1}
+[002] {'action': 'click', 'x': 2, 'y': 2} -> {"action": "click", "x": 2, "y": 2}
+[003] {'action': 'click', 'x': 3, 'y': 3} -> {"action": "click", "x": 3, "y": 3}
+[001] {'action': 'click', 'x': 1, 'y': 1} -> {"action": "click", "x": 1, "y": 1}
+[002] {'action': 'click', 'x': 2, 'y': 2} -> {"action": "click", "x": 2, "y": 2}
+[003] {'action': 'click', 'x': 3, 'y': 3} -> {"action": "click", "x": 3, "y": 3}

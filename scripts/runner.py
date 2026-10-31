@@ -1,0 +1,187 @@
+"""scripts/runner.py — Ejecuta todas las pruebas de pruebas/ contra el agente.
+
+Para cada JSON:
+  1. POST /__reset al escritorio
+  2. POST /tasks al agente local
+  3. Espera hasta que la tarea no esté en_curso
+  4. POST /__check con el JSON de la prueba
+  5. Muestra tabla de resultados
+
+Uso:
+    export ESCRITORIO_URL=...
+    export ESCRITORIO_TOKEN=...
+    export ESCRITORIO_PASSWORD=...
+    export EQUIPO_TOKEN=...
+    export AGENTE_URL=http://127.0.0.1:8000
+    python scripts/runner.py
+"""
+import asyncio
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+import httpx
+
+PRUEBAS = Path(__file__).resolve().parent.parent / "pruebas"
+
+AGENTE_URL = os.getenv("AGENTE_URL", "http://127.0.0.1:8000")
+ESCRITORIO_URL = os.getenv("ESCRITORIO_URL", "").rstrip("/")
+ESCRITORIO_TOKEN = os.getenv("ESCRITORIO_TOKEN", "")
+ESCRITORIO_PASSWORD = os.getenv("ESCRITORIO_PASSWORD", "")
+EQUIPO_TOKEN = os.getenv("EQUIPO_TOKEN", "")
+
+POLL_INTERVAL = 5   # segundos entre consultas (igual que el evaluador)
+
+
+def _check_env():
+    missing = []
+    for name in ("ESCRITORIO_URL", "ESCRITORIO_TOKEN", "ESCRITORIO_PASSWORD", "EQUIPO_TOKEN"):
+        if not os.getenv(name):
+            missing.append(name)
+    if missing:
+        print(f"❌ Faltan variables de entorno: {', '.join(missing)}")
+        sys.exit(1)
+
+
+async def _reset(client: httpx.AsyncClient) -> bool:
+    r = await client.post(
+        f"{ESCRITORIO_URL}/__reset",
+        headers={"Authorization": f"Bearer {ESCRITORIO_TOKEN}"},
+    )
+    ok = r.status_code == 200
+    if not ok:
+        print(f"   ⚠️  Reset falló: {r.status_code} {r.text[:200]}")
+    return ok
+
+
+async def _send_task(client: httpx.AsyncClient, instruccion: str) -> str:
+    r = await client.post(
+        f"{AGENTE_URL}/tasks",
+        headers={"Authorization": f"Bearer {EQUIPO_TOKEN}"},
+        json={
+            "tarea": instruccion,
+            "escritorio": {
+                "url": f"{ESCRITORIO_URL}/websockify",
+                "password": ESCRITORIO_PASSWORD,
+            },
+        },
+    )
+    if r.status_code != 202:
+        raise RuntimeError(f"POST /tasks falló: {r.status_code} {r.text}")
+    return r.json()["task_id"]
+
+
+async def _wait_task(client: httpx.AsyncClient, task_id: str) -> dict:
+    t0 = time.monotonic()
+    while True:
+        r = await client.get(
+            f"{AGENTE_URL}/tasks/{task_id}",
+            headers={"Authorization": f"Bearer {EQUIPO_TOKEN}"},
+        )
+        data = r.json()
+        estado = data["estado"]
+        if estado != "en_curso":
+            return data
+        if time.monotonic() - t0 > 310:  # 5 min + margen
+            raise RuntimeError("Timeout esperando la tarea")
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+async def _check(client: httpx.AsyncClient, prueba: dict) -> dict:
+    r = await client.post(
+        f"{ESCRITORIO_URL}/__check",
+        headers={"Authorization": f"Bearer {ESCRITORIO_TOKEN}"},
+        json=prueba,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"POST /__check falló: {r.status_code} {r.text}")
+    return r.json()
+
+
+async def main():
+    _check_env()
+    archivos = sorted(PRUEBAS.glob("*.json"))
+    if not archivos:
+        print("❌ No hay archivos JSON en pruebas/")
+        sys.exit(1)
+
+    resultados: list[dict] = []
+    async with httpx.AsyncClient() as client:
+        for fichero in archivos:
+            print(f"\n{'='*60}")
+            print(f"📄 {fichero.name}")
+            print("=" * 60)
+
+            with open(fichero) as fh:
+                prueba = json.load(fh)
+
+            instruccion = prueba["instruccion"]
+            esperado = prueba.get("estado_esperado", "?")
+            print(f"📝 Tarea: {instruccion[:80]}...")
+            print(f"🎯 Esperado: {esperado}")
+
+            # 1. Reset
+            print("🔄 Reset escritorio...")
+            if not await _reset(client):
+                resultados.append({
+                    "prueba": fichero.name,
+                    "agente_estado": "N/A",
+                    "agente_resumen": "Reset falló",
+                    "check_pass": False,
+                    "checks": [],
+                })
+                continue
+
+            # 2. Enviar tarea
+            print("🚀 Enviando tarea al agente...")
+            task_id = await _send_task(client, instruccion)
+            print(f"   task_id: {task_id}")
+
+            # 3. Esperar resultado
+            print("⏳ Esperando resultado...")
+            resultado_agente = await _wait_task(client, task_id)
+            estado_agente = resultado_agente["estado"]
+            resumen_agente = resultado_agente.get("resumen", "")
+            print(f"   Estado agente: {estado_agente}")
+            print(f"   Resumen: {resumen_agente[:200]}...")
+
+            # 4. Check
+            print("🔍 Verificando contra /__check...")
+            check = await _check(client, prueba)
+            check_pass = check.get("pass", False)
+            checks = check.get("checks", [])
+            for c in checks:
+                icon = "✅" if c["ok"] else "❌"
+                print(f"   {icon} {c['nombre']}: {'OK' if c['ok'] else 'FAIL'}")
+            print(f"   Total check: {'PASS' if check_pass else 'FAIL'}")
+
+            resultados.append({
+                "prueba": fichero.name,
+                "agente_estado": estado_agente,
+                "agente_resumen": resumen_agente,
+                "check_pass": check_pass,
+                "checks": checks,
+            })
+
+    # Tabla final
+    print("\n" + "=" * 80)
+    print(f"{'Prueba':25} {'Estado Agente':15} {'Check':8} {'Detalle'}")
+    print("=" * 80)
+    for r in resultados:
+        ok = "✅ PASS" if r["check_pass"] else "❌ FAIL"
+        detalles = ", ".join(
+            f"{c['nombre']}: {'OK' if c['ok'] else 'FAIL'}"
+            for c in r["checks"]
+        )
+        print(f"{r['prueba']:25} {r['agente_estado']:15} {ok:8} {detalles}")
+    print("=" * 80)
+
+    total = len(resultados)
+    passed = sum(1 for r in resultados if r["check_pass"])
+    print(f"\n📊 Total: {passed}/{total} pasaron")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

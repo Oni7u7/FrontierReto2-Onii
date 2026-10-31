@@ -6,17 +6,21 @@ Rutas:
   POST /tasks          → recibe tarea + escritorio, devuelve task_id (< 2 s)
   GET  /tasks/{id}     → estado + resumen de la tarea
 
-Todas las rutas exigen Authorization: Bearer <EQUIPO_TOKEN>.
-El estado se guarda en memoria. Una sola tarea activa a la vez;
-si llega otra se encola.
+Todas las rutas exigen Authorization: Bearer <EQUIPO_TOKEN> (comparado
+con hmac.compare_digest para evitar timing attacks).
+
+Estado en memoria. Una sola tarea activa a la vez; si llega otra se
+CANCELA la anterior (marca fallida con "cancelada por tarea nueva") y
+se arranca la nueva.
 """
 
 import asyncio
+import hmac
 import os
 import uuid
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -28,9 +32,9 @@ app = FastAPI(title="SIGECOM Agent")
 # Estado en memoria
 # ------------------------------------------------------------------
 
-_TASKS: dict[str, dict[str, Any]] = {}          # task_id → {estado, resumen, task}
-_TASK_QUEUE: asyncio.Queue[str] = asyncio.Queue()  # cola de task_ids pendientes
-_CURRENT_TASK: asyncio.Task | None = None
+_TASKS: dict[str, dict[str, Any]] = {}
+_CURRENT_TASK_ID: str | None = None
+_CURRENT_ASYNCIO_TASK: asyncio.Task | None = None
 _LOCK = asyncio.Lock()
 
 
@@ -48,10 +52,6 @@ class TaskIn(BaseModel):
     escritorio: Escritorio
 
 
-class TaskOut(BaseModel):
-    task_id: str
-
-
 class TaskStatus(BaseModel):
     estado: str
     resumen: str
@@ -63,56 +63,36 @@ class TaskStatus(BaseModel):
 
 def _validar_token(authorization: str | None) -> None:
     token_esperado = os.getenv("EQUIPO_TOKEN", "")
-    expected = f"Bearer {token_esperado}" if token_esperado else None
-    if not authorization or authorization != expected:
+    expected = f"Bearer {token_esperado}"
+    if not authorization or not hmac.compare_digest(authorization, expected):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 # ------------------------------------------------------------------
-# Tarea worker (corre una tarea de la cola)
+# Runner de tarea
 # ------------------------------------------------------------------
 
-async def _worker() -> None:
-    global _CURRENT_TASK
-    while True:
-        task_id = await _TASK_QUEUE.get()
-        async with _LOCK:
-            if _TASKS.get(task_id, {}).get("estado") != "encolada":
-                continue  # cancelada o ya procesada
-            _TASKS[task_id]["estado"] = "en_curso"
+async def _run_task(task_id: str, tarea: str, ws_url: str, password: str) -> None:
+    """Corre una tarea y guarda el resultado en _TASKS."""
+    try:
+        resultado = await ejecutar_tarea(task_id, tarea, ws_url, password)
+    except asyncio.CancelledError:
+        resultado = {"estado": "fallida", "resumen": "cancelada por tarea nueva"}
+    except Exception as exc:
+        resultado = {
+            "estado": "fallida",
+            "resumen": f"Error interno del agente: {type(exc).__name__}: {exc}",
+        }
 
-        tarea = _TASKS[task_id]["tarea"]
-        ws_url = _TASKS[task_id]["ws_url"]
-        password = _TASKS[task_id]["password"]
+    # Filtrar contraseña del escritorio del resumen
+    resumen = resultado.get("resumen", "")
+    if password and password in resumen:
+        resumen = resumen.replace(password, "***")
 
-        try:
-            resultado = await ejecutar_tarea(task_id, tarea, ws_url, password)
-        except Exception as exc:
-            resultado = {
-                "estado": "fallida",
-                "resumen": f"Error interno del agente: {type(exc).__name__}: {exc}",
-            }
-
-        async with _LOCK:
-            _TASKS[task_id]["estado"] = resultado["estado"]
-            _TASKS[task_id]["resumen"] = resultado["resumen"]
-            _CURRENT_TASK = None
-
-        _TASK_QUEUE.task_done()
-
-        # Lanza la siguiente si hay algo en cola
-        await _maybe_start_next()
-
-
-async def _maybe_start_next() -> None:
-    global _CURRENT_TASK
     async with _LOCK:
-        if _CURRENT_TASK is not None:
-            return
-        if _TASK_QUEUE.empty():
-            return
-        # No sacamos aquí; _worker hace get()
-        _CURRENT_TASK = asyncio.create_task(_worker())
+        if _TASKS.get(task_id, {}).get("estado") == "en_curso":
+            _TASKS[task_id]["estado"] = resultado["estado"]
+            _TASKS[task_id]["resumen"] = resumen
 
 
 # ------------------------------------------------------------------
@@ -132,18 +112,27 @@ async def create_task(
 ) -> JSONResponse:
     _validar_token(authorization)
 
+    global _CURRENT_ASYNCIO_TASK, _CURRENT_TASK_ID
     task_id = str(uuid.uuid4())
     async with _LOCK:
+        # Cancelar tarea anterior si existe
+        if _CURRENT_ASYNCIO_TASK is not None and not _CURRENT_ASYNCIO_TASK.done():
+            _CURRENT_ASYNCIO_TASK.cancel()
+            if _CURRENT_TASK_ID and _CURRENT_TASK_ID in _TASKS:
+                _TASKS[_CURRENT_TASK_ID]["estado"] = "fallida"
+                _TASKS[_CURRENT_TASK_ID]["resumen"] = "cancelada por tarea nueva"
+
         _TASKS[task_id] = {
-            "estado": "encolada",
+            "estado": "en_curso",
             "resumen": "",
             "tarea": payload.tarea,
             "ws_url": payload.escritorio.url,
             "password": payload.escritorio.password,
         }
-
-    await _TASK_QUEUE.put(task_id)
-    await _maybe_start_next()
+        _CURRENT_TASK_ID = task_id
+        _CURRENT_ASYNCIO_TASK = asyncio.create_task(
+            _run_task(task_id, payload.tarea, payload.escritorio.url, payload.escritorio.password)
+        )
 
     return JSONResponse(content={"task_id": task_id}, status_code=202)
 

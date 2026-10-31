@@ -10,9 +10,9 @@ ejecutar_tarea(tarea, ws_url, password):
      Excepción: done con estado fallida y sin acciones previas se acepta.
   4. Límite duro 4 m 15 s (255 s).
   5. Detección de bucles (misma acción + screenshot igual ×3).
-  6. Filtro de secretos en resumen y logs.
+  6. Filtro de secretos en resumen y logs (incluye password del escritorio).
   7. Verificación final opcional (conservadora: no invierte terminada).
-  8. Al terminar o fallar cierra Desktop inmediatamente.
+  8. Al terminar, cancelar o fallar cierra Desktop inmediatamente.
 """
 
 import asyncio
@@ -36,15 +36,19 @@ MAX_PASOS = 50               # límite de iteraciones por tarea
 SETTLE = 1.3                 # segundos de espera tras cada acción
 STEP_TIMEOUT = 90.0          # máximo para una llamada al modelo
 
-_SECRETOS = ["OPENROUTER_API_KEY", "EQUIPO_TOKEN"]
+_SECRETOS_ENV = ["OPENROUTER_API_KEY", "EQUIPO_TOKEN"]
 
 
-def _filtrar_secretos(texto: str) -> str:
+def _filtrar_secretos(texto: str, extra: list[str] | None = None) -> str:
     """Reemplaza en el string cualquier valor de variable sensible por ***."""
-    for nombre in _SECRETOS:
+    for nombre in _SECRETOS_ENV:
         valor = os.getenv(nombre)
         if valor and valor in texto:
             texto = texto.replace(valor, "***")
+    if extra:
+        for val in extra:
+            if val and val in texto:
+                texto = texto.replace(val, "***")
     texto = _borrar_api_keys(texto)
     return texto
 
@@ -94,7 +98,7 @@ async def ejecutar_tarea(
         """Guarda captura + descripción en disco, filtrando secretos."""
         n = str(paso).zfill(3)
         (log_dir / f"step_{n}.png").write_bytes(captura)
-        txt_filtrado = _filtrar_secretos(txt)
+        txt_filtrado = _filtrar_secretos(txt, extra=[password])
         with open(log_dir / "acciones.txt", "a", encoding="utf-8") as fh:
             fh.write(f"[{n}] {accion} -> {txt_filtrado}\n")
 
@@ -138,28 +142,17 @@ async def ejecutar_tarea(
             done_actions = [a for a in acciones if a.get("action") == "done"]
             otras_acciones = [a for a in acciones if a.get("action") != "done"]
 
-            # Si hay done mezclado con otras acciones, descartamos el done
-            # y ejecutamos solo las otras (luego captura nueva y reconsulta)
             if done_actions and otras_acciones:
-                done = done_actions[0]
-                # Ejecutamos solo las acciones reales
+                # done mezclado → ejecutar solo acciones, descartar done
                 acciones_a_ejecutar = otras_acciones
-                # Nota en historial para el modelo
                 historial.append({
                     "nota": "done descartado: había acciones sin ejecutar, se ejecutaron primero"
                 })
-                # No procesamos el done ahora; el bucle continuará
-                procesar_done_ahora = False
             elif done_actions and not otras_acciones:
-                # done va SOLO en el turno → lo aceptamos
-                # Excepción: siempre aceptamos done fallida (incluso sin acciones previas)
-                done = done_actions[0]
-                acciones_a_ejecutar = [done]
-                procesar_done_ahora = True
+                # done solo → aceptar
+                acciones_a_ejecutar = [done_actions[0]]
             else:
-                # No hay done en este turno
                 acciones_a_ejecutar = acciones
-                procesar_done_ahora = False
 
             # 4. ejecutar secuencialmente
             for idx, accion in enumerate(acciones_a_ejecutar):
@@ -169,15 +162,13 @@ async def ejecutar_tarea(
                 accion_str = json.dumps(accion, ensure_ascii=False)
 
                 # detección de bucle: solo la ÚLTIMA acción del turno
-                # (como en la versión anterior, para que [click, wait]
-                #  no se cancele por click sino por wait)
                 es_ultima = (idx == len(acciones_a_ejecutar) - 1)
                 if es_ultima and accion.get("action") != "done":
                     h = hashlib.sha256(captura).hexdigest()[:16]
                     act_hash = f"{accion_str}_{h}"
                     if act_hash == ultima_accion_json:
                         repeticiones_bucle += 1
-                        if repeticiones_bucle >= 2:  # 3 veces en total
+                        if repeticiones_bucle >= 2:
                             estado = "fallida"
                             resumen = (
                                 "La tarea entró en bucle: la pantalla y las acciones "
@@ -203,14 +194,14 @@ async def ejecutar_tarea(
                     resumen = accion.get("resumen", "")
                     break
 
-            # Si descartamos un done, ya tomamos captura tras la última acción
-            # (el bucle continúa con una consulta fresca)
-
         # ---------- post-bucle ----------
         if estado == "en_curso":
             estado = "fallida"
             resumen = f"Tiempo o pasos agotados ({paso} pasos, {255 - int(_queda())} s)."
 
+    except asyncio.CancelledError:
+        estado = "fallida"
+        resumen = "cancelada por tarea nueva"
     except asyncio.TimeoutError:
         estado = "fallida"
         resumen = "Tiempo de ejecución agotado (4 min 15 s)."
@@ -220,8 +211,8 @@ async def ejecutar_tarea(
     finally:
         await _cerrar()
 
-    # ---------- filtrar secretos ----------
-    resumen = _filtrar_secretos(resumen)
+    # ---------- filtrar secretos (incluye password del escritorio) ----------
+    resumen = _filtrar_secretos(resumen, extra=[password])
 
     # ---------- verificación final (conservadora) ----------
     if estado == "terminada":
